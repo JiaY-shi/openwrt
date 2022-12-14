@@ -1,0 +1,14 @@
+[ "$ACTION" == "add" ] || exit 0
+
+PHY_NUM=${DEVPATH##*/phy}
+
+[ -n $PHY_NUM ] || exit 0
+
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+case "$(board_name)" in
+*)
+	echo "Don't support for $(board_name)"
+;;
+esac
