@@ -4,8 +4,8 @@
 
 include $(TOPDIR)/rules.mk
 
-BOARD:=armsr
-BOARDNAME:=Arm SystemReady (EFI) compliant
+BOARD:=armvirt
+BOARDNAME:=QEMU ARM Virtual Machine
 FEATURES:=fpu pci pcie rtc usb boot-part rootfs-part
 FEATURES+=cpiogz ext4 ramdisk squashfs targz vmdk
 
