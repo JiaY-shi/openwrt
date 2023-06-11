@@ -5,8 +5,8 @@
   - "target/linux/apm821xx/**"
 "target/archs38":
   - "target/linux/archs38/**"
-"target/armsr":
-  - "target/linux/armsr/**"
+"target/armvirt":
+  - "target/linux/armvirt/**"
 "target/at91":
   - "target/linux/at91/**"
   - "package/boot/at91bootstrap/**"
