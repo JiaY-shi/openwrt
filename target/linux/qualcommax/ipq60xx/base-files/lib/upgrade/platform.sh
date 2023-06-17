@@ -51,6 +51,8 @@ platform_do_upgrade() {
 		fw_setenv auto_recovery yes
 		nand_do_upgrade "$1"
 		;;
+	glinet,gl-axt1800|\
+	glinet,gl-ax1800|\
 	netgear,wax214|\
 	qihoo,360v6)
 		nand_do_upgrade "$1"
