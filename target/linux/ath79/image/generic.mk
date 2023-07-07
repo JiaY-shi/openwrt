@@ -9,6 +9,7 @@ DEVICE_VARS += ADDPATTERN_ID ADDPATTERN_VERSION
 DEVICE_VARS += SEAMA_SIGNATURE SEAMA_MTDBLOCK
 DEVICE_VARS += KERNEL_INITRAMFS_PREFIX DAP_SIGNATURE
 DEVICE_VARS += EDIMAX_HEADER_MAGIC EDIMAX_HEADER_MODEL
+DEVICE_VARS += MOXA_MAGIC MOXA_HWID
 DEVICE_VARS += OPENMESH_CE_TYPE ZYXEL_MODEL_STRING
 DEVICE_VARS += SUPPORTED_TELTONIKA_DEVICES
 
@@ -738,6 +739,17 @@ define Device/comfast_cf-e375ac
   IMAGE_SIZE := 16000k
 endef
 TARGET_DEVICES += comfast_cf-e375ac
+
+define Device/comfast_cf-e380ac-v2
+  SOC := qca9558
+  DEVICE_VENDOR := COMFAST
+  DEVICE_MODEL := CF-E380AC
+  DEVICE_VARIANT := v2
+  DEVICE_PACKAGES := kmod-usb-core kmod-usb2 \
+	kmod-ath10k-ct ath10k-firmware-qca988x-ct
+  IMAGE_SIZE := 16000k
+endef
+TARGET_DEVICES += comfast_cf-e380ac-v2
 
 define Device/comfast_cf-e5
   SOC := qca9531
@@ -1818,6 +1830,19 @@ define Device/mercury_mw4530r-v1
   SUPPORTED_DEVICES += tl-wdr4300
 endef
 TARGET_DEVICES += mercury_mw4530r-v1
+
+define Device/moxa_awk-1137c
+  SOC := ar9344
+  DEVICE_MODEL := AWK-1137C
+  DEVICE_VENDOR := MOXA
+  MOXA_MAGIC := 0x8919123028877702
+  MOXA_HWID := 0x01080000
+  IMAGE_SIZE := 14336k
+  DEVICE_PACKAGES := uboot-envtools
+  IMAGES += factory.rom
+  IMAGE/factory.rom := $$(IMAGE/sysupgrade.bin) | moxa-encode-fw
+endef
+TARGET_DEVICES += moxa_awk-1137c
 
 define Device/nec_wx1200cr
   DEVICE_VENDOR := NEC
