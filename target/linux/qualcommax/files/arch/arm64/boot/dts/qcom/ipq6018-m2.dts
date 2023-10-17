@@ -257,7 +257,7 @@
 		qcom,mactype = <0>;
 		local-mac-address = [000000000000];
 		qcom,id = <4>;
-		phy-handle = <&qca8075_2>;
+		phy-handle = <&qca8075_3>;
 		phy-mode = "sgmii";
 	};
 
