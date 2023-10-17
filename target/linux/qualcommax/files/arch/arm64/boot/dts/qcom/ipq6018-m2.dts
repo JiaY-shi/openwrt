@@ -35,16 +35,14 @@
 
 	keys {
 		compatible = "gpio-keys";
-		pinctrl-0 = <&button_pins>;
-		pinctrl-names = "default";
 
-		wps-button {
+		wps {
 			label = "wps";
 			gpios = <&tlmm 9 GPIO_ACTIVE_LOW>;
 			linux,code = <KEY_WPS_BUTTON>;
 		};
 
-		reset-button {
+		reset {
 			label = "reset";
 			gpios = <&tlmm 60 GPIO_ACTIVE_LOW>;
 			linux,code = <KEY_RESTART>;
@@ -89,16 +87,15 @@
 };
 
 &tlmm {
-
-	mdio_pins: mdio-state {
-		mdc-pins {
+	mdio_pins: mdio-pins {
+		mdc {
 			pins = "gpio64";
 			function = "mdc";
 			drive-strength = <8>;
 			bias-pull-up;
 		};
 
-		mdio-pins {
+		mdio {
 			pins = "gpio65";
 			function = "mdio";
 			drive-strength = <8>;
@@ -106,15 +103,15 @@
 		};
 	};
 
-	button_pins: button-state {
-		wps-pins {
+    button_pins: button_pins {
+		wps_button {
 			pins = "gpio9";
 			function = "gpio";
 			drive-strength = <8>;
 			bias-pull-up;
 		};
 
-		rst-pins {
+		reset_button {
 			pins = "gpio60";
 			function = "gpio";
 			drive-strength = <8>;
@@ -122,13 +119,15 @@
 		};
 	};
 
-	leds_pins: leds-state {
-		pins = "gpio35", "gpio37",
-			"gpio58", "gpio70",
-			"gpio73", "gpio74";
-		function = "gpio";
-		drive-strength = <8>;
-		bias-pull-down;
+	leds_pins: leds_pins {
+		mux {
+			pins = "gpio35", "gpio37",
+				"gpio58", "gpio70",
+				"gpio73", "gpio74";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-down;
+		};
 	};
 };
 
