@@ -253,7 +253,7 @@
     dp4: dp@4 {
 		device_type = "network";
 		compatible = "qcom,nss-dp";
-		reg = <0x0 0x3a001400 0x0 0x200>;
+                reg = <0x0 0x3a001600 0x0 0x200>;
 		qcom,mactype = <0>;
 		local-mac-address = [000000000000];
 		qcom,id = <4>;
