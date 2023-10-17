@@ -17,9 +17,9 @@ platform_pre_upgrade() {
 platform_do_upgrade() {
 	case "$(board_name)" in
   	zn,m2|\
-	glinet,gl-axt1800|\
-	glinet,gl-ax1800)|\
-		nand_do_upgrade "$1"
+ 	glinet,gl-axt1800|\
+ 	glinet,gl-ax1800)
+ 		nand_do_upgrade "$1"
 		;;
 	*)
 		default_do_upgrade "$1"
