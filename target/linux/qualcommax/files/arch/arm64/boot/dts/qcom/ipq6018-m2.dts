@@ -1,0 +1,280 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR BSD-3-Clause
+
+/dts-v1/;
+
+#include "ipq6018.dtsi"
+#include "ipq6018-upstreamable.dtsi"
+#include "ipq6018-ess.dtsi"
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	model = "ZN M2";
+	compatible = "zn,m2", "qcom,ipq6018";
+
+	aliases {
+		serial0 = &blsp1_uart3;
+		led-boot = &led_power;
+		led-failsafe = &led_power;
+		led-running = &led_power;
+		led-upgrade = &led_power;
+		/*
+		 * Aliases as required by u-boot
+		 * to patch MAC addresses
+		 */
+		ethernet0 = &dp1;
+		ethernet1 = &dp2;
+		ethernet2 = &dp3;
+		ethernet3 = &dp4;
+	};
+
+	chosen {
+		bootargs-append = " root=/dev/ubiblock0_1 swiotlb=1";
+	};
+
+	keys {
+		compatible = "gpio-keys";
+		pinctrl-0 = <&button_pins>;
+		pinctrl-names = "default";
+
+		wps-button {
+			label = "wps";
+			gpios = <&tlmm 9 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_WPS_BUTTON>;
+		};
+
+		reset-button {
+			label = "reset";
+			gpios = <&tlmm 60 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		pinctrl-0 = <&leds_pins>;
+		pinctrl-names = "default";
+
+		led_power: power {
+			label = "m2:blue:power";
+			gpio = <&tlmm 58 GPIO_ACTIVE_HIGH>;
+		};
+
+		mesh {
+			label = "m2:blue:mesh";
+			gpio = <&tlmm 73 GPIO_ACTIVE_HIGH>;
+		};
+
+		lan {
+			label = "m2:blue:lan";
+			gpio = <&tlmm 74 GPIO_ACTIVE_HIGH>;
+		};
+
+		wan {
+			label = "m2:blue:wan";
+			gpio = <&tlmm 37 GPIO_ACTIVE_HIGH>;
+		};
+
+		wlan5g {
+			label = "m2:blue:wlan5g";
+			gpio = <&tlmm 35 GPIO_ACTIVE_HIGH>;
+		};
+
+		wlan2g {
+			label = "m2:blue:wlan2g";
+			gpio = <&tlmm 70 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
+
+&tlmm {
+
+	mdio_pins: mdio-state {
+		mdc-pins {
+			pins = "gpio64";
+			function = "mdc";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+
+		mdio-pins {
+			pins = "gpio65";
+			function = "mdio";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+	};
+
+	button_pins: button-state {
+		wps-pins {
+			pins = "gpio9";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+
+		rst-pins {
+			pins = "gpio60";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+	};
+
+	leds_pins: leds-state {
+		pins = "gpio35", "gpio37",
+			"gpio58", "gpio70",
+			"gpio73", "gpio74";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-pull-down;
+	};
+};
+
+&blsp1_uart3 {
+	pinctrl-0 = <&serial_3_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&qpic_bam {
+	status = "okay";
+};
+
+&qpic_nand {
+	status = "okay";
+
+	nand@0 {
+		reg = <0>;
+
+		nand-ecc-strength = <4>;
+		nand-ecc-step-size = <512>;
+		nand-bus-width = <8>;
+
+		partitions {
+			compatible = "qcom,smem-part";
+		};
+	};
+};
+
+&mdio {
+	status = "okay";
+
+	pinctrl-0 = <&mdio_pins>;
+	pinctrl-names = "default";
+	reset-gpios = <&tlmm 75 GPIO_ACTIVE_LOW>;
+
+	qca8075_0: ethernet-phy@0 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <4>;
+	};
+
+	qca8075_1: ethernet-phy@1 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <0>;
+	};
+
+	qca8075_2: ethernet-phy@2 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <1>;
+	};
+
+	qca8075_3: ethernet-phy@3 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <3>;
+	};
+};
+
+&switch {
+	status = "okay";
+
+
+	switch_mac_mode = <0x0>; /* mac mode for uniphy instance0*/
+	switch_mac_mode1 = <0xff>; /* mac mode for uniphy instance1*/
+	switch_mac_mode2 = <0xff>; /* mac mode for uniphy instance2*/
+	qcom,port_phyinfo {
+		port@0 {
+			port_id = <0x01>;
+			phy_address = <0x00>;
+		};
+		port@1 {
+			port_id = <0x02>;
+			phy_address = <0x01>;
+		};
+		port@2 {
+			port_id = <0x04>;
+			phy_address = <0x03>;
+		};
+		port@3 {
+			port_id = <0x05>;
+			phy_address = <0x04>;
+		};
+	};
+};
+
+&edma {
+	status = "okay";
+};
+
+&soc {
+    dp1: dp@1 {
+		device_type = "network";
+		compatible = "qcom,nss-dp";
+		reg = <0x0 0x3a001000 0x0 0x200>;
+		qcom,mactype = <0>;
+		local-mac-address = [000000000000];
+		qcom,id = <5>;
+		phy-handle = <&qca8075_0>;
+		phy-mode = "sgmii";
+	};
+
+    dp2: dp@2 {
+		device_type = "network";
+		compatible = "qcom,nss-dp";
+		reg = <0x0 0x3a001200 0x0 0x200>;
+		qcom,mactype = <0>;
+		local-mac-address = [000000000000];
+		qcom,id = <1>;
+		phy-handle = <&qca8075_1>;
+		phy-mode = "sgmii";
+	};
+
+    dp3: dp@3 {
+		device_type = "network";
+		compatible = "qcom,nss-dp";
+		reg = <0x0 0x3a001400 0x0 0x200>;
+		qcom,mactype = <0>;
+		local-mac-address = [000000000000];
+		qcom,id = <2>;
+		phy-handle = <&qca8075_2>;
+		phy-mode = "sgmii";
+	};
+    dp4: dp@4 {
+		device_type = "network";
+		compatible = "qcom,nss-dp";
+		reg = <0x0 0x3a001400 0x0 0x200>;
+		qcom,mactype = <0>;
+		local-mac-address = [000000000000];
+		qcom,id = <4>;
+		phy-handle = <&qca8075_2>;
+		phy-mode = "sgmii";
+	};
+
+};
+
+&CPU0 {
+	/delete-property/ cpu-supply;
+};
+
+&CPU1 {
+	/delete-property/ cpu-supply;
+};
+
+&CPU2 {
+	/delete-property/ cpu-supply;
+};
+
+&CPU3 {
+	/delete-property/ cpu-supply;
+};
