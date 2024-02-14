@@ -89,21 +89,25 @@
 &dp1 {
 	phy-handle = <&phy_0>;
 	status = "okay";
+	qcom,id = <5>;
 };
 
 &dp2 {
 	phy-handle = <&phy_1>;
 	status = "okay";
+	qcom,id = <1>;
 };
 
 &dp3 {
 	phy-handle = <&phy_2>;
 	status = "okay";
+	qcom,id = <2>;
 };
 
 &dp4 {
 	phy-handle = <&phy_3>;
 	status = "okay";
+	qcom,id = <4>;
 };
 
 &edma {
@@ -135,6 +139,12 @@
 
 &switch {
 	status = "okay";
+
+	switch_lan_bmp = <(ESS_PORT1 | ESS_PORT2 | ESS_PORT4)>; /* lan port bitmap */
+	switch_wan_bmp = <ESS_PORT5>; /* wan port bitmap */
+	switch_mac_mode = <MAC_MODE_DISABLED>; /* MAC mode for UNIPHY instance 0 */
+	switch_mac_mode1 = <MAC_MODE_DISABLED>; /* MAC mode for UNIPHY instance 1 */
+	switch_mac_mode2 = <MAC_MODE_DISABLED>; /* MAC mode for UNIPHY instance 2 */
 
 	qcom,port_phyinfo {
 		port@0 {

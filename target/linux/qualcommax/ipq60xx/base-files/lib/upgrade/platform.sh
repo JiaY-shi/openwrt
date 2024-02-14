@@ -16,7 +16,11 @@ platform_pre_upgrade() {
 
 platform_do_upgrade() {
 	case "$(board_name)" in
+	redmi,ax5|\
 	cmiot,ax18|\
+	zn,m2|\
+	qihoo,v6|\
+	xiaomi,ax1800|\
 	glinet,gl-axt1800|\
 	glinet,gl-ax1800)
 		nand_do_upgrade "$1"

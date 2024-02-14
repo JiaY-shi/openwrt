@@ -30,6 +30,7 @@ endef
 ALLWIFIBOARDS:= \
 	arcadyan_aw1000 \
 	buffalo_wxr-5950ax12 \
+  cmiot_ax18 \
 	compex_wpq873 \
 	dynalink_dl-wrx36 \
 	edgecore_eap102 \
@@ -44,12 +45,16 @@ ALLWIFIBOARDS:= \
 	netgear_wax630 \
 	prpl_haze \
 	qnap_301w \
+  qihoo_v6 \
+  redmi_ax5 \
 	redmi_ax6 \
 	wallys_dr40x9 \
+  xiaomi_ax1800 \
 	xiaomi_ax3600 \
 	xiaomi_ax9000 \
 	yyets_le1 \
 	yuncore_ax880 \
+  zn_m2 \
 	zte_mf269 \
 	zte_mf289f \
 	zte_mf287 \
@@ -160,13 +165,17 @@ $(eval $(call generate-ipq-wifi-package,netgear_wax218,Netgear WAX218))
 $(eval $(call generate-ipq-wifi-package,netgear_wax620,Netgear WAX620))
 $(eval $(call generate-ipq-wifi-package,netgear_wax630,Netgear WAX630))
 $(eval $(call generate-ipq-wifi-package,qnap_301w,QNAP 301w))
+$(eval $(call generate-ipq-wifi-package,qihoo_v6,Qihoo V6))
 $(eval $(call generate-ipq-wifi-package,prpl_haze,prpl Haze))
+$(eval $(call generate-ipq-wifi-package,redmi_ax5,Redmi AX5))
 $(eval $(call generate-ipq-wifi-package,redmi_ax6,Redmi AX6))
 $(eval $(call generate-ipq-wifi-package,wallys_dr40x9,Wallys DR40X9))
+$(eval $(call generate-ipq-wifi-package,xiaomi_ax1800,Xiaomi AX1800))
 $(eval $(call generate-ipq-wifi-package,xiaomi_ax3600,Xiaomi AX3600))
 $(eval $(call generate-ipq-wifi-package,xiaomi_ax9000,Xiaomi AX9000))
 $(eval $(call generate-ipq-wifi-package,yyets_le1,YYeTs LE1))
 $(eval $(call generate-ipq-wifi-package,yuncore_ax880,Yuncore AX880))
+$(eval $(call generate-ipq-wifi-package,zn_m2,ZN M2))
 $(eval $(call generate-ipq-wifi-package,zte_mf269,ZTE MF269))
 $(eval $(call generate-ipq-wifi-package,zte_mf289f,ZTE MF289F))
 $(eval $(call generate-ipq-wifi-package,zte_mf287,ZTE MF287))
