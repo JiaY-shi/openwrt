@@ -84,6 +84,6 @@ define Device/qihoo_360v6
 	DEVICE_DTS_CONFIG := config@cp03-c1
 	DEVICE_DTS := ipq6018-qihoo-360v6
 	SOC := ipq6018
-	DEVICE_PACKAGES := ipq-wifi-qihoo_v6
+	DEVICE_PACKAGES := ipq-wifi-qihoo_360v6
 endef
 TARGET_DEVICES += qihoo_360v6
