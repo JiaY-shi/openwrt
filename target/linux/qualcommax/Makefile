@@ -15,6 +15,8 @@ DEFAULT_PACKAGES += \
 	kmod-usb3 kmod-usb-dwc3 kmod-usb-dwc3-qcom \
 	kmod-leds-gpio kmod-gpio-button-hotplug \
 	kmod-qca-nss-dp kmod-ath11k-ahb \
+	kmod-qca-nss-dp kmod-qca-nss-drv-bridge-mgr kmod-qca-nss-drv-clmapmgr kmod-qca-nss-drv-gre kmod-qca-nss-drv-match kmod-qca-nss-drv-pppoe kmod-qca-nss-drv-qdisc kmod-qca-nss-drv-vlan-mgr \
+	kmod-qca-nss-ecm kmod-qrtr-mhi \
 	wpad-basic-mbedtls uboot-envtools \
 	e2fsprogs kmod-fs-ext4 losetup
 

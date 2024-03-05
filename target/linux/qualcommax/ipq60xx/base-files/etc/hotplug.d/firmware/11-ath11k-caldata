@@ -11,7 +11,8 @@ case "$FIRMWARE" in
 	case $(board_name) in
 	cmiot,ax18|\
 	glinet,gl-axt1800|\
-	glinet,gl-ax1800)
+	glinet,gl-ax1800|\
+	qihoo,360v6)
 		caldata_extract "0:art" 0x1000 0x10000
 		;;
 	jdc,ax1800-pro)

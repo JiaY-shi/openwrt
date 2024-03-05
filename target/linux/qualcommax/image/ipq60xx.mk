@@ -72,4 +72,18 @@ define Device/jdc_ax1800-pro
 	IMAGES += factory.bin
 	IMAGE/factory.bin := append-kernel | pad-to 6144k |  append-rootfs | append-metadata
 endef
-TARGET_DEVICES += jdc_ax1800-pro
+TARGET_DEVICES += jdc_ax1800-Pro
+
+define Device/qihoo_360v6
+	$(call Device/FitImage)
+	$(call Device/UbiFit)
+	DEVICE_VENDOR := Qihoo
+	DEVICE_MODEL := 360V6
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	DEVICE_DTS_CONFIG := config@cp03-c1
+	DEVICE_DTS := ipq6018-qihoo-360v6
+	SOC := ipq6018
+	DEVICE_PACKAGES := ipq-wifi-qihoo_v6
+endef
+TARGET_DEVICES += qihoo_360v6

@@ -12,7 +12,8 @@ platform_do_upgrade() {
 	case "$(board_name)" in
 	cmiot,ax18|\
 	glinet,gl-axt1800|\
-	glinet,gl-ax1800)
+	glinet,gl-ax1800|\
+	qihoo,360v6)
 		nand_do_upgrade "$1"
 		;;
 	jdc,ax1800-pro)
