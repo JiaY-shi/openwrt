@@ -72,7 +72,7 @@ define Device/jdc_ax1800-pro
 	IMAGES += factory.bin
 	IMAGE/factory.bin := append-kernel | pad-to 6144k |  append-rootfs | append-metadata
 endef
-TARGET_DEVICES += jdc_ax1800-Pro
+TARGET_DEVICES += jdc_ax1800-pro
 
 define Device/qihoo_360v6
 	$(call Device/FitImage)
