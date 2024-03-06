@@ -3,11 +3,11 @@
 #
 
 # this can be used as a generic mmc upgrade script
-# just add a device entry in platform.sh, 
+# just add a device entry in platform.sh,
 # define "kernelname" and "rootfsname" and call mmc_do_upgrade
-# after the kernel and rootfs flash a loopdev (as overlay) is 
+# after the kernel and rootfs flash a loopdev (as overlay) is
 # setup on top of the rootfs partition
-# for the proper function a padded rootfs image is needed, basically 
+# for the proper function a padded rootfs image is needed, basically
 # append "pad-to 64k" to the image definition
 # this is based on the ipq806x zyxel.sh mmc upgrade
 
@@ -18,11 +18,11 @@ mmc_do_upgrade() {
 	local rootfs=
 	local kernel=
 
-			[ -z "$kernel" ] && kernel=$(find_mmc_part ${kernelname})
-			[ -z "$rootfs" ] && rootfs=$(find_mmc_part ${rootfsname})
+	[ -z "$kernel" ] && kernel=$(find_mmc_part ${kernelname})
+	[ -z "$rootfs" ] && rootfs=$(find_mmc_part ${rootfsname})
 
-			[ -z "$kernel" ] && echo "Upgrade failed: kernel partition not found! Rebooting..." && reboot -f
-			[ -z "$rootfs" ] && echo "Upgrade failed: rootfs partition not found! Rebooting..." && reboot -f
+	[ -z "$kernel" ] && echo "Upgrade failed: kernel partition not found! Rebooting..." && reboot -f
+	[ -z "$rootfs" ] && echo "Upgrade failed: rootfs partition not found! Rebooting..." && reboot -f
 
 	mmc_do_flash $tar_file $kernel $rootfs
 
@@ -33,7 +33,7 @@ mmc_do_flash() {
 	local tar_file=$1
 	local kernel=$2
 	local rootfs=$3
-	
+
 	# keep sure its unbound
 	losetup --detach-all || {
 		echo Failed to detach all loop devices. Skip this try.

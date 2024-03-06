@@ -61,15 +61,16 @@ TARGET_DEVICES += glinet_gl-axt1800
 
 define Device/jdc_ax1800-pro
 	$(call Device/FitImage)
-	DEVICE_VENDOR := JD Cloud
-	DEVICE_MODEL := JDC AX1800 Pro
+	DEVICE_VENDOR := JDCloud
+	DEVICE_MODEL := JDCloud AX1800 Pro
 	DEVICE_DTS_CONFIG := config@cp03-c2
 	DEVICE_DTS := ipq6018-jdc-ax1800-pro
 	SOC := ipq6018
 	DEVICE_PACKAGES := ipq-wifi-jdc_ax1800-pro kmod-fs-ext4 mkf2fs f2fsck kmod-fs-f2fs
 	BLOCKSIZE := 64k
 	KERNEL_SIZE := 6144k
-	IMAGES += factory.bin
-	IMAGE/factory.bin := append-kernel | pad-to 6144k |  append-rootfs | append-metadata
+	IMAGES += factory.bin sysupgrade.bin
+	IMAGE/factory.bin := append-kernel | pad-to $$$${KERNEL_SIZE} | append-rootfs | pad-rootfs
+	IMAGE/sysupgrade.bin/squashfs := append-rootfs | pad-to $$$${BLOCKSIZE} | sysupgrade-tar rootfs=$$$$@ | append-metadata
 endef
 TARGET_DEVICES += jdc_ax1800-pro
