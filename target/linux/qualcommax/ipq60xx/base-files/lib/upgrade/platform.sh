@@ -57,6 +57,11 @@ platform_do_upgrade() {
 	qihoo,360v6)
 		nand_do_upgrade "$1"
 		;;
+	jdc,ax1800-pro)
+		kernelname="0:HLOS"
+		rootfsname="rootfs"
+		mmc_do_upgrade "$1"
+		;;
 	yuncore,fap650)
 		[ "$(fw_printenv -n owrt_env_ver 2>/dev/null)" != "7" ] && yuncore_fap650_env_setup
 		local active="$(fw_printenv -n owrt_slotactive 2>/dev/null)"
