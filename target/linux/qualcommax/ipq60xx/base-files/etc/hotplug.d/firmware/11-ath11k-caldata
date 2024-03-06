@@ -33,6 +33,9 @@ case "$FIRMWARE" in
 	netgear,wax214)
 		caldata_extract "0:art" 0x1000 0x10000
 		;;
+	jdc,ax1800-pro)
+		caldata_extract_mmc "0:ART" 0x1000 0x10000
+		;;
 	qihoo,360v6)
 		caldata_extract "0:art" 0x1000 0x10000
 		label_mac=$(mtd_get_mac_ascii factory lanMac)
