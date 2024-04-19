@@ -44,7 +44,7 @@
 
 	chosen {
 		bootargs = "console=ttyMSM0,115200,n8";
-		bootargs-append = " rootfstype=squashfs,ext4 swiotlb=1 coherent_pool=2M swiotlb=1";
+		bootargs-append = " rootfstype=squashfs,ext4 swiotlb=1 coherent_pool=2M";
 	};
 
 	gpio_keys {
