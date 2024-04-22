@@ -7,3 +7,4 @@ src-git nss_packages https://github.com/JiaY-shi/nss-packages.git;k6.6
 #src-git targets https://github.com/openwrt/targets.git
 #src-git oldpackages http://git.openwrt.org/packages.git
 #src-link custom /usr/src/openwrt/custom-feed
+src-git kiddin9 https://github.com/kiddin9/openwrt-packages.git
