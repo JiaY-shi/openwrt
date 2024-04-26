@@ -8,7 +8,9 @@ board=$(board_name)
 
 case "$board" in
 jdc,ax1800-pro)
-    ucidef_set_led_netdev "wan" "WAN" "net_blue" "eth3"
+    ucidef_set_led_default "green" "GREEN" "green:status" "1"
+    ucidef_set_led_default "blue" "BLUE" "blue:status" "0"
+    ucidef_set_led_default "red" "RED" "red:status" "0"
     ;;
 yuncore,fap650)
 	ucidef_set_led_netdev "wlan5ghz" "WLAN 5GHz LED" "blue:wlan-5ghz" "wlan0" "tx rx"
