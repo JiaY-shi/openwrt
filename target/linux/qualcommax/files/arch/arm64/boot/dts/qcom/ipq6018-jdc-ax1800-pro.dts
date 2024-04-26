@@ -98,7 +98,7 @@
 		mux {
 			pins = "gpio38","gpio39","gpio40","gpio41";
 			function = "blsp0_spi";
-			drive-strength = <0x08>;
+			drive-strength = <8>;
 			bias-pull-down;
 		};
 	};
@@ -125,21 +125,21 @@
 		mux_0 {
 			pins = "gpio64";
 			function = "mdc";
-			drive-strength = <0x08>;
+			drive-strength = <8>;
 			bias-pull-up;
 		};
 
 		mux_1 {
 			pins = "gpio65";
 			function = "mdio";
-			drive-strength = <0x08>;
+			drive-strength = <8>;
 			bias-pull-up;
 		};
 
 		mux_2 {
 			pins = "gpio75";
 			function = "gpio";
-		bias-pull-up;
+			bias-pull-up;
 		};
 	};
 };
@@ -286,36 +286,41 @@
 	status = "okay";
 	qcom,ath11k-calibration-variant = "JDC-AX1800-Pro";
 	qcom,ath11k-fw-memory-mode = <1>;
+	status = "okay";
 };
-
 
 &dp2 {
 	phy-handle = <&qca8075_1>;
+	label = "lan1";
 	status = "okay";
 };
 
 &dp3 {
 	phy-handle = <&qca8075_2>;
+	label = "lan2";
 	status = "okay";
 };
 
 &dp4 {
 	phy-handle = <&qca8075_3>;
+	label = "lan3";
 	status = "okay";
 };
 
 &dp5 {
 	phy-handle = <&qca8075_4>;
 	phy-mode = "psgmii";
+	label = "wan";
 	status = "okay";
 };
 
 &sdhc_1 {
-	status = "okay";
-
 	/delete-property/ mmc-hs400-1_8v;
+	bus-width = <8>;
 	mmc-hs200-1_8v;
 	mmc-ddr-1_8v;
+	non-removable;
+	status = "okay";
 };
 
 &CPU0 {
