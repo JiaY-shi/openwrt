@@ -1,0 +1,61 @@
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -849,7 +849,7 @@ static struct ath11k_hw_params ath11k_hw
+ 		.svc_to_ce_map_len = SVC_CE_MAP_LEN_5018,
+ 		.single_pdev_only = false,
+ 		.rxdma1_enable = true,
+-		.num_rxmda_per_pdev = RXDMA_PER_PDEV_5018,
++		.num_rxdma_per_pdev = RXDMA_PER_PDEV_5018,
+ 		.rx_mac_buf_ring = false,
+ 		.vdev_start_delay = false,
+ 		.htt_peer_map_v2 = true,
+--- a/drivers/net/wireless/ath/ath11k/pcic.c
++++ b/drivers/net/wireless/ath/ath11k/pcic.c
+@@ -898,7 +898,7 @@ int ath11k_pcic_ext_config_gic_msi_irq(s
+ {
+ 	u32 user_base_data = 0, base_vector = 0, base_idx;
+ 	struct ath11k_ext_irq_grp *irq_grp;
+-	int j, ret = 0, num_vectors = 0;
++	int j, n, ret = 0, num_vectors = 0;
+ 	u32 num_irq = 0;
+ 
+ 	base_idx = ATH11K_PCI_IRQ_CE0_OFFSET + CE_COUNT_MAX;
+@@ -910,8 +910,13 @@ int ath11k_pcic_ext_config_gic_msi_irq(s
+ 	irq_grp = &ab->ext_irq_grp[i];
+ 	irq_grp->ab = ab;
+ 	irq_grp->grp_id = i;
+-	init_dummy_netdev(&irq_grp->napi_ndev);
+-	netif_napi_add(&irq_grp->napi_ndev, &irq_grp->napi,
++	irq_grp->napi_ndev = alloc_netdev_dummy(0);
++	if (!irq_grp->napi_ndev) {
++		ret = -ENOMEM;
++		goto fail_allocate;
++	}
++
++	netif_napi_add(irq_grp->napi_ndev, &irq_grp->napi,
+ 		       ath11k_pcic_ext_grp_napi_poll);
+ 
+ 	if (ab->hw_params.ring_mask->tx[i] ||
+@@ -940,13 +945,21 @@ int ath11k_pcic_ext_config_gic_msi_irq(s
+ 		if (ret) {
+ 			ath11k_err(ab, "failed request irq %d: %d\n",
+ 				   irq_idx, ret);
+-			return ret;
++			goto fail_irq;
+ 		}
+ 		ab->irq_num[irq_idx] = msi_desc->irq;
+ 		ab->ipci.dp_irq_num[vector] = msi_desc->irq;
+ 		ab->ipci.dp_msi_data[i] = msi_desc->msg.data;
+ 		disable_irq_nosync(ab->irq_num[irq_idx]);
+ 	}
++	return 0;
++fail_irq:
++	j += 1;
++fail_allocate:
++	for (n = 0; n <= j; n++) {
++		irq_grp = &ab->ext_irq_grp[n];
++		free_netdev(irq_grp->napi_ndev);
++	}
+ 	return ret;
+ }
+ 

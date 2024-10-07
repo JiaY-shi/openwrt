@@ -1,0 +1,474 @@
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -142,58 +142,47 @@ enum ext_irq_num {
+ };
+ 
+ static int
+-ath11k_ahb_get_msi_irq_wcn6750(struct ath11k_base *ab, unsigned int vector)
++ath11k_ahb_get_msi_irq(struct ath11k_base *ab, unsigned int vector)
+ {
+ 	return ab->pci.msi.irqs[vector];
+ }
+ 
+-static inline u32
+-ath11k_ahb_get_window_start_wcn6750(struct ath11k_base *ab, u32 offset)
++static u32 ath11k_ahb_get_window_start(struct ath11k_base *ab, u32 offset)
+ {
+-	u32 window_start = 0;
+-
+-	/* If offset lies within DP register range, use 1st window */
+-	if ((offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK)
+-		window_start = ATH11K_PCI_WINDOW_START;
+-	/* If offset lies within CE register range, use 2nd window */
+-	else if ((offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) <
+-		 ATH11K_PCI_WINDOW_RANGE_MASK)
+-		window_start = 2 * ATH11K_PCI_WINDOW_START;
+-
+-	return window_start;
++	return ath11k_pcic_get_window_start(ab, offset, ATH11K_BUS_AHB);
+ }
+ 
+ static void
+-ath11k_ahb_window_write32_wcn6750(struct ath11k_base *ab, u32 offset, u32 value)
++ath11k_ahb_window_write32(struct ath11k_base *ab, u32 offset, u32 value)
+ {
+ 	u32 window_start;
+ 
+ 	/* WCN6750 uses static window based register access*/
+-	window_start = ath11k_ahb_get_window_start_wcn6750(ab, offset);
++	window_start = ath11k_ahb_get_window_start(ab, offset);
+ 
+ 	iowrite32(value, ab->mem + window_start +
+ 		  (offset & ATH11K_PCI_WINDOW_RANGE_MASK));
+ }
+ 
+-static u32 ath11k_ahb_window_read32_wcn6750(struct ath11k_base *ab, u32 offset)
++static u32 ath11k_ahb_window_read32(struct ath11k_base *ab, u32 offset)
+ {
+ 	u32 window_start;
+ 	u32 val;
+ 
+ 	/* WCN6750 uses static window based register access */
+-	window_start = ath11k_ahb_get_window_start_wcn6750(ab, offset);
++	window_start = ath11k_ahb_get_window_start(ab, offset);
+ 
+ 	val = ioread32(ab->mem + window_start +
+ 		       (offset & ATH11K_PCI_WINDOW_RANGE_MASK));
+ 	return val;
+ }
+ 
+-static const struct ath11k_pci_ops ath11k_ahb_pci_ops_wcn6750 = {
++static const struct ath11k_pci_ops ath11k_ahb_pci_ops = {
+ 	.wakeup = NULL,
+ 	.release = NULL,
+-	.get_msi_irq = ath11k_ahb_get_msi_irq_wcn6750,
+-	.window_write32 = ath11k_ahb_window_write32_wcn6750,
+-	.window_read32 = ath11k_ahb_window_read32_wcn6750,
++	.get_msi_irq = ath11k_ahb_get_msi_irq,
++	.window_write32 = ath11k_ahb_window_write32,
++	.window_read32 = ath11k_ahb_window_read32,
+ };
+ 
+ static inline u32 ath11k_ahb_read32(struct ath11k_base *ab, u32 offset)
+@@ -1142,7 +1131,7 @@ static int ath11k_ahb_probe(struct platf
+ 		break;
+ 	case ATH11K_HW_WCN6750_HW10:
+ 		hif_ops = &ath11k_ahb_hif_ops_wcn6750;
+-		pci_ops = &ath11k_ahb_pci_ops_wcn6750;
++		pci_ops = &ath11k_ahb_pci_ops;
+ 		break;
+ 	default:
+ 		dev_err(&pdev->dev, "unsupported device type %d\n", hw_rev);
+--- a/drivers/net/wireless/ath/ath11k/pci.c
++++ b/drivers/net/wireless/ath/ath11k/pci.c
+@@ -56,18 +56,7 @@ static void ath11k_pci_bus_release(struc
+ 
+ static u32 ath11k_pci_get_window_start(struct ath11k_base *ab, u32 offset)
+ {
+-	if (!ab->hw_params.static_window_map)
+-		return ATH11K_PCI_WINDOW_START;
+-
+-	if ((offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK)
+-		/* if offset lies within DP register range, use 3rd window */
+-		return 3 * ATH11K_PCI_WINDOW_START;
+-	else if ((offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) <
+-		 ATH11K_PCI_WINDOW_RANGE_MASK)
+-		 /* if offset lies within CE register range, use 2nd window */
+-		return 2 * ATH11K_PCI_WINDOW_START;
+-	else
+-		return ATH11K_PCI_WINDOW_START;
++	return ath11k_pcic_get_window_start(ab, offset, ATH11K_BUS_PCI);
+ }
+ 
+ static inline void ath11k_pci_select_window(struct ath11k_pci *ab_pci, u32 offset)
+@@ -161,20 +150,6 @@ static const struct ath11k_msi_config ms
+ 	},
+ };
+ 
+-static inline void ath11k_pci_select_static_window(struct ath11k_pci *ab_pci)
+-{
+-	u32 umac_window;
+-	u32 ce_window;
+-	u32 window;
+-
+-	umac_window = FIELD_GET(ATH11K_PCI_WINDOW_VALUE_MASK, HAL_SEQ_WCSS_UMAC_OFFSET);
+-	ce_window = FIELD_GET(ATH11K_PCI_WINDOW_VALUE_MASK, HAL_CE_WFSS_CE_REG_BASE);
+-	window = (umac_window << 12) | (ce_window << 6);
+-
+-	iowrite32(ATH11K_PCI_WINDOW_ENABLE_BIT | window,
+-		  ab_pci->ab->mem + ATH11K_PCI_WINDOW_REG_ADDRESS);
+-}
+-
+ static void ath11k_pci_soc_global_reset(struct ath11k_base *ab)
+ {
+ 	u32 val, delay;
+@@ -644,7 +619,7 @@ static int ath11k_pci_power_up(struct at
+ 	}
+ 
+ 	if (ab->hw_params.static_window_map)
+-		ath11k_pci_select_static_window(ab_pci);
++		ath11k_pcic_config_static_window(ab);
+ 
+ 	return 0;
+ }
+--- a/drivers/net/wireless/ath/ath11k/pcic.c
++++ b/drivers/net/wireless/ath/ath11k/pcic.c
+@@ -7,6 +7,10 @@
+ #include "core.h"
+ #include "pcic.h"
+ #include "debug.h"
++#include "pci.h"
++#include <linux/msi.h>
++#include <linux/platform_device.h>
++#include <linux/pci.h>
+ 
+ static const char *irq_name[ATH11K_IRQ_NUM_MAX] = {
+ 	"bhi",
+@@ -126,6 +130,15 @@ static const struct ath11k_msi_config at
+ 		},
+ 		.hw_rev = ATH11K_HW_QCA2066_HW21,
+ 	},
++	{
++		.total_vectors = 13,
++		.total_users = 2,
++		.users = (struct ath11k_msi_user[]) {
++			{ .name = "CE", .num_vectors = 5, .base_vector = 0 },
++			{ .name = "DP", .num_vectors = 8, .base_vector = 5 },
++		},
++		.hw_rev = ATH11K_HW_QCN6122_HW10,
++	},
+ };
+ 
+ int ath11k_pcic_init_msi_config(struct ath11k_base *ab)
+@@ -335,6 +348,15 @@ void ath11k_pcic_free_irq(struct ath11k_
+ }
+ EXPORT_SYMBOL(ath11k_pcic_free_irq);
+ 
++void ath11k_pcic_ipci_free_irq(struct ath11k_base *ab)
++{
++	struct platform_device *pdev = ab->pdev;
++
++	ath11k_pcic_free_irq(ab);
++	platform_msi_domain_free_irqs(&pdev->dev);
++}
++EXPORT_SYMBOL(ath11k_pcic_ipci_free_irq);
++
+ static void ath11k_pcic_ce_irq_enable(struct ath11k_base *ab, u16 ce_id)
+ {
+ 	u32 irq_idx;
+@@ -808,7 +830,7 @@ int ath11k_pcic_register_pci_ops(struct
+ 		return 0;
+ 
+ 	/* Return error if mandatory pci_ops callbacks are missing */
+-	if (!pci_ops->get_msi_irq || !pci_ops->window_write32 ||
++	if (!pci_ops->window_write32 ||
+ 	    !pci_ops->window_read32)
+ 		return -EINVAL;
+ 
+@@ -850,3 +872,251 @@ void ath11k_pci_disable_ce_irqs_except_w
+ 	}
+ }
+ EXPORT_SYMBOL(ath11k_pci_disable_ce_irqs_except_wake_irq);
++
++void ath11k_pcic_select_static_window(struct ath11k_base *ab)
++{
++	u32 umac_window = FIELD_GET(ATH11K_PCI_WINDOW_VALUE_MASK, HAL_SEQ_WCSS_UMAC_OFFSET);
++	u32 ce_window = FIELD_GET(ATH11K_PCI_WINDOW_VALUE_MASK, HAL_CE_WFSS_CE_REG_BASE);
++	u32 window;
++
++	window = (umac_window << 12) | (ce_window << 6);
++
++	iowrite32(ATH11K_PCI_WINDOW_ENABLE_BIT | window,
++		  ab->mem + ATH11K_PCI_WINDOW_REG_ADDRESS);
++}
++
++void ath11k_pcic_config_static_window(struct ath11k_base *ab)
++{
++	if (ab->hw_params.static_window_map)
++		ath11k_pcic_select_static_window(ab);
++}
++EXPORT_SYMBOL(ath11k_pcic_config_static_window);
++
++int ath11k_pcic_ext_config_gic_msi_irq(struct ath11k_base *ab, struct platform_device *pdev,
++				      struct msi_desc *msi_desc, int i)
++{
++	u32 user_base_data = 0, base_vector = 0, base_idx;
++	struct ath11k_ext_irq_grp *irq_grp;
++	int j, ret = 0, num_vectors = 0;
++	u32 num_irq = 0;
++
++	base_idx = ATH11K_PCI_IRQ_CE0_OFFSET + CE_COUNT_MAX;
++	ret = ath11k_pcic_get_user_msi_assignment(ab, "DP", &num_vectors,
++						 &user_base_data, &base_vector);
++	if (ret < 0)
++		return ret;
++
++	irq_grp = &ab->ext_irq_grp[i];
++	irq_grp->ab = ab;
++	irq_grp->grp_id = i;
++	init_dummy_netdev(&irq_grp->napi_ndev);
++	netif_napi_add(&irq_grp->napi_ndev, &irq_grp->napi,
++		       ath11k_pcic_ext_grp_napi_poll);
++
++	if (ab->hw_params.ring_mask->tx[i] ||
++	    ab->hw_params.ring_mask->rx[i] ||
++	    ab->hw_params.ring_mask->rx_err[i] ||
++	    ab->hw_params.ring_mask->rx_wbm_rel[i] ||
++	    ab->hw_params.ring_mask->reo_status[i] ||
++	    ab->hw_params.ring_mask->rxdma2host[i] ||
++	    ab->hw_params.ring_mask->host2rxdma[i] ||
++	    ab->hw_params.ring_mask->rx_mon_status[i]) {
++		num_irq = 1;
++	}
++
++	irq_grp->num_irq = num_irq;
++	irq_grp->irqs[0] = base_idx + i;
++
++	for (j = 0; j < irq_grp->num_irq; j++) {
++		int irq_idx = irq_grp->irqs[j];
++		int vector = (i % num_vectors);
++
++		irq_set_status_flags(msi_desc->irq, IRQ_DISABLE_UNLAZY);
++		ret = devm_request_irq(&pdev->dev, msi_desc->irq,
++				       ath11k_pcic_ext_interrupt_handler,
++				       IRQF_SHARED, "irq",
++				       irq_grp);
++		if (ret) {
++			ath11k_err(ab, "failed request irq %d: %d\n",
++				   irq_idx, ret);
++			return ret;
++		}
++		ab->irq_num[irq_idx] = msi_desc->irq;
++		ab->ipci.dp_irq_num[vector] = msi_desc->irq;
++		ab->ipci.dp_msi_data[i] = msi_desc->msg.data;
++		disable_irq_nosync(ab->irq_num[irq_idx]);
++	}
++	return ret;
++}
++
++int ath11k_pcic_config_gic_msi_irq(struct ath11k_base *ab, struct platform_device *pdev,
++				  struct msi_desc *msi_desc, int i)
++{
++	struct ath11k_ce_pipe *ce_pipe = &ab->ce.ce_pipe[i];
++	int irq_idx, ret;
++
++	tasklet_setup(&ce_pipe->intr_tq, ath11k_pcic_ce_tasklet);
++	irq_idx = ATH11K_PCI_IRQ_CE0_OFFSET + i;
++
++	ret = devm_request_irq(&pdev->dev, msi_desc->irq,
++			       ath11k_pcic_ce_interrupt_handler,
++			       IRQF_SHARED, "ce",
++			       ce_pipe);
++	if (ret) {
++		ath11k_warn(ab, "failed to request irq %d: %d\n",
++			    irq_idx, ret);
++		return ret;
++	}
++	ab->irq_num[irq_idx] = msi_desc->irq;
++	ab->ipci.ce_msi_data[i] = msi_desc->msg.data;
++	ath11k_pcic_ce_irq_disable(ab, i);
++
++	return ret;
++}
++
++static void ath11k_msi_msg_handler(struct msi_desc *desc, struct msi_msg *msg)
++{
++	desc->msg.address_lo = msg->address_lo;
++	desc->msg.address_hi = msg->address_hi;
++	desc->msg.data = msg->data;
++}
++
++int ath11k_pcic_ipci_config_irq(struct ath11k_base *ab)
++{
++	int ret;
++	struct platform_device *pdev = ab->pdev;
++	struct msi_desc *msi_desc;
++	bool ce_done = false;
++	int i = 0;
++
++	ret = ath11k_pcic_init_msi_config(ab);
++	if (ret) {
++		ath11k_err(ab, "failed to fetch msi config: %d\n", ret);
++		return ret;
++	}
++
++	ret = platform_msi_domain_alloc_irqs(&pdev->dev, ab->pci.msi.config->total_vectors,
++					     ath11k_msi_msg_handler);
++	if (ret) {
++		ath11k_warn(ab, "failed to alloc irqs %d ab %pM\n", ret, ab);
++		return ret;
++	}
++
++	msi_for_each_desc(msi_desc, &pdev->dev, MSI_DESC_ALL) {
++		if (!ce_done && i == ab->hw_params.ce_count) {
++			i = 0;
++			ce_done = true;
++		}
++
++		if (!ce_done && i < ab->hw_params.ce_count) {
++			if (ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
++				i++;
++
++			ret = ath11k_pcic_config_gic_msi_irq(ab, pdev, msi_desc, i);
++			if (ret) {
++				ath11k_warn(ab, "failed to request irq %d\n", ret);
++				return ret;
++			}
++		} else {
++			ret = ath11k_pcic_ext_config_gic_msi_irq(ab, pdev, msi_desc, i);
++			if (ret) {
++				ath11k_warn(ab, "failed to config ext msi irq %d\n", ret);
++				return ret;
++			}
++		}
++
++		i++;
++		ab->pci.msi.addr_lo = msi_desc->msg.address_lo;
++		ab->pci.msi.addr_hi = msi_desc->msg.address_hi;
++
++		if (i == 0 && !ce_done)
++			ab->pci.msi.ep_base_data = msi_desc->msg.data;
++	}
++
++	msi_for_each_desc(msi_desc, &pdev->dev, MSI_DESC_ALL) {
++		u32 user_base_data = 0, base_vector = 0;
++		int vector, num_vectors = 0;
++
++		ret = ath11k_pcic_get_user_msi_assignment(ab, "DP", &num_vectors,
++							 &user_base_data, &base_vector);
++		if (ret < 0)
++			return ret;
++
++		vector = (i % num_vectors);
++
++		if (i >= ATH11K_EXT_IRQ_GRP_NUM_MAX)
++			break;
++
++		if (ab->ipci.dp_irq_num[vector] != msi_desc->irq)
++			continue;
++
++		ret = ath11k_pcic_ext_config_gic_msi_irq(ab, pdev, msi_desc, i);
++		if (ret) {
++			ath11k_warn(ab, "failed to config ext msi irq %d\n", ret);
++			return ret;
++		}
++
++		i++;
++	}
++
++	ab->ipci.gic_enabled = 1;
++	wake_up(&ab->ipci.gic_msi_waitq);
++	return ret;
++}
++EXPORT_SYMBOL(ath11k_pcic_ipci_config_irq);
++
++u32 ath11k_pcic_get_window_start(struct ath11k_base *ab, u32 offset,
++				 enum ath11k_bus bus)
++{
++	u32 window_start = 0;
++
++	if (bus == ATH11K_BUS_PCI) {
++        	if (!ab->hw_params.static_window_map)
++        		return ATH11K_PCI_WINDOW_START;
++
++		/* if offset lies within DP register range, use 3rd window */
++		if ((offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) <
++		    ATH11K_PCI_WINDOW_RANGE_MASK)
++			window_start = 3 * ATH11K_PCI_WINDOW_START;
++		/* if offset lies within CE register range, use 2nd window */
++		else if ((offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) <
++			 ATH11K_PCI_WINDOW_RANGE_MASK)
++			window_start = 2 * ATH11K_PCI_WINDOW_START;
++		else
++			window_start = ATH11K_PCI_WINDOW_START;
++	} else if (bus == ATH11K_BUS_AHB) {
++		/* If offset lies within DP register range, use 1st window */
++		if ((offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) <
++		    ATH11K_PCI_WINDOW_RANGE_MASK)
++			window_start = ((ab->hw_params.dp_window) ? ab->hw_params.dp_window : 1)
++					* ATH11K_PCI_WINDOW_START;
++		/* If offset lies within CE register range, use 2nd window */
++		else if ((offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) <
++			 ATH11K_PCI_WINDOW_RANGE_MASK)
++			window_start = 2 * ATH11K_PCI_WINDOW_START;
++		else
++			window_start = ATH11K_PCI_WINDOW_START;
++	}
++	else {
++		/* Must not come here */
++		WARN_ON(1);
++	}
++
++	return window_start;
++}
++EXPORT_SYMBOL(ath11k_pcic_get_window_start);
++
++u32 ath11k_pci_get_window_offset(struct ath11k_base *ab, u32 offset)
++{
++	u32 window_start;
++
++	if (ab->hw_params.static_window_map) {
++		window_start = ath11k_pcic_get_window_start(ab, offset,
++			       ATH11K_BUS_PCI);
++
++		if (window_start)
++			offset = window_start + (offset & ATH11K_PCI_WINDOW_RANGE_MASK);
++	}
++	return offset;
++}
++EXPORT_SYMBOL(ath11k_pci_get_window_offset);
+--- a/drivers/net/wireless/ath/ath11k/pcic.h
++++ b/drivers/net/wireless/ath/ath11k/pcic.h
+@@ -51,4 +51,12 @@ int ath11k_pcic_read(struct ath11k_base
+ void ath11k_pci_enable_ce_irqs_except_wake_irq(struct ath11k_base *ab);
+ void ath11k_pci_disable_ce_irqs_except_wake_irq(struct ath11k_base *ab);
+ 
++void ath11k_pcic_select_static_window(struct ath11k_base *ab);
++void ath11k_pcic_ipci_free_irq(struct ath11k_base *ab);
++int ath11k_pcic_ipci_config_irq(struct ath11k_base *ab);
++void ath11k_pcic_config_static_window(struct ath11k_base *ab);
++u32 ath11k_pcic_get_window_start(struct ath11k_base *ab, u32 offset,
++				 enum ath11k_bus bus);
++u32 ath11k_pci_get_window_offset(struct ath11k_base *ab, u32 offset);
++
+ #endif
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -871,6 +871,7 @@ static struct ath11k_hw_params ath11k_hw
+ 		.support_off_channel_tx = false,
+ 		.tcl_ring_retry = true,
+ 		.tx_ring_size = DP_TCL_DATA_RING_SIZE,
++		.dp_window = 3,
+ 	},
+ };
+ 
+--- a/drivers/net/wireless/ath/ath11k/hw.h
++++ b/drivers/net/wireless/ath/ath11k/hw.h
+@@ -232,6 +232,7 @@ struct ath11k_hw_params {
+ 	bool smp2p_wow_exit;
+ 	bool support_fw_mac_sequence;
+ 	bool support_dual_stations;
++	u8 dp_window;
+ };
+ 
+ struct ath11k_hw_ops {
