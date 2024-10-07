@@ -1,0 +1,202 @@
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -446,6 +446,9 @@ static void ath11k_ahb_free_irq(struct a
+ 	int irq_idx;
+ 	int i;
+ 
++	if (ab->hw_params.internal_pci)
++		return ath11k_pcic_ipci_free_irq(ab);
++
+ 	if (ab->hw_params.hybrid_bus_type)
+ 		return ath11k_pcic_free_irq(ab);
+ 
+@@ -607,6 +610,9 @@ static int ath11k_ahb_config_irq(struct
+ 	int irq, irq_idx, i;
+ 	int ret;
+ 
++	if (ab->hw_params.internal_pci)
++		return ath11k_pcic_ipci_config_irq(ab);
++
+ 	if (ab->hw_params.hybrid_bus_type)
+ 		return ath11k_pcic_config_irq(ab);
+ 
+@@ -911,6 +917,11 @@ static int ath11k_ahb_setup_resources(st
+ 	struct resource *mem_res;
+ 	void __iomem *mem;
+ 
++	if (ab->hw_params.internal_pci) {
++		set_bit(ATH11K_FLAG_MULTI_MSI_VECTORS, &ab->dev_flags);
++		return 0;
++	}
++
+ 	if (ab->hw_params.hybrid_bus_type)
+ 		return ath11k_ahb_setup_msi_resources(ab);
+ 
+--- a/drivers/net/wireless/ath/ath11k/ce.c
++++ b/drivers/net/wireless/ath/ath11k/ce.c
+@@ -548,7 +548,11 @@ static void ath11k_ce_srng_msi_ring_para
+ 
+ 	ring_params->msi_addr = addr_lo;
+ 	ring_params->msi_addr |= (dma_addr_t)(((uint64_t)addr_hi) << 32);
+-	ring_params->msi_data = (msi_data_idx % msi_data_count) + msi_data_start;
++	if (ab->hw_params.internal_pci)
++		ring_params->msi_data = ab->ipci.ce_msi_data[ce_id];
++	else
++		ring_params->msi_data = (msi_data_idx % msi_data_count) + msi_data_start;
++
+ 	ring_params->flags |= HAL_SRNG_FLAGS_MSI_INTR;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -871,6 +871,7 @@ static struct ath11k_hw_params ath11k_hw
+ 		.support_off_channel_tx = false,
+ 		.tcl_ring_retry = true,
+ 		.tx_ring_size = DP_TCL_DATA_RING_SIZE,
++		.internal_pci = true,
+ 		.dp_window = 3,
+ 	},
+ };
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -883,6 +883,14 @@ struct ath11k_msi_config {
+ 	u16 hw_rev;
+ };
+ 
++struct ath11k_internal_pci {
++	bool gic_enabled;
++	wait_queue_head_t gic_msi_waitq;
++	u32 dp_msi_data[ATH11K_EXT_IRQ_GRP_NUM_MAX];
++	u32 ce_msi_data[CE_CNT_5018];
++	u32 dp_irq_num[8];
++};
++
+ /* Master structure to hold the hw data which may be used in core module */
+ struct ath11k_base {
+ 	enum ath11k_hw_rev hw_rev;
+@@ -944,6 +952,7 @@ struct ath11k_base {
+ 	struct list_head peers;
+ 	wait_queue_head_t peer_mapping_wq;
+ 	u8 mac_addr[ETH_ALEN];
++	struct ath11k_internal_pci ipci;
+ 	int irq_num[ATH11K_IRQ_NUM_MAX];
+ 	struct ath11k_ext_irq_grp ext_irq_grp[ATH11K_EXT_IRQ_GRP_NUM_MAX];
+ 	struct ath11k_targ_cap target_caps;
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -216,8 +216,12 @@ static void ath11k_dp_srng_msi_setup(str
+ 
+ 	ring_params->msi_addr = addr_lo;
+ 	ring_params->msi_addr |= (dma_addr_t)(((uint64_t)addr_hi) << 32);
+-	ring_params->msi_data = (msi_group_number % msi_data_count)
++	if (ab->hw_params.internal_pci) {
++		ring_params->msi_data = ab->ipci.dp_msi_data[msi_group_number];
++	} else {
++		ring_params->msi_data = (msi_group_number % msi_data_count)
+ 		+ msi_data_start;
++	}
+ 	ring_params->flags |= HAL_SRNG_FLAGS_MSI_INTR;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath11k/hw.h
++++ b/drivers/net/wireless/ath/ath11k/hw.h
+@@ -232,6 +232,7 @@ struct ath11k_hw_params {
+ 	bool smp2p_wow_exit;
+ 	bool support_fw_mac_sequence;
+ 	bool support_dual_stations;
++	bool internal_pci;
+ 	u8 dp_window;
+ };
+ 
+--- a/drivers/net/wireless/ath/ath11k/pcic.c
++++ b/drivers/net/wireless/ath/ath11k/pcic.c
+@@ -770,7 +770,8 @@ EXPORT_SYMBOL(ath11k_pcic_stop);
+ 
+ int ath11k_pcic_start(struct ath11k_base *ab)
+ {
+-	set_bit(ATH11K_FLAG_DEVICE_INIT_DONE, &ab->dev_flags);
++	if (!ab->hw_params.internal_pci)
++		set_bit(ATH11K_FLAG_DEVICE_INIT_DONE, &ab->dev_flags);
+ 
+ 	ath11k_pcic_ce_irqs_enable(ab);
+ 	ath11k_ce_rx_post_buf(ab);
+--- a/drivers/net/wireless/ath/ath11k/qmi.c
++++ b/drivers/net/wireless/ath/ath11k/qmi.c
+@@ -2124,7 +2124,7 @@ static int ath11k_qmi_request_device_inf
+ 	int ret;
+ 
+ 	/* device info message req is only sent for hybrid bus devices */
+-	if (!ab->hw_params.hybrid_bus_type)
++	if (!ab->hw_params.hybrid_bus_type && !ab->hw_params.internal_pci)
+ 		return 0;
+ 
+ 	ret = qmi_txn_init(&ab->qmi.handle, &txn,
+@@ -2184,6 +2184,12 @@ static int ath11k_qmi_request_device_inf
+ 	ab->mem = bar_addr_va;
+ 	ab->mem_len = resp.bar_size;
+ 
++	if (ab->hw_params.internal_pci)
++		ath11k_hif_config_static_window(ab);
++
++	ath11k_dbg(ab, ATH11K_DBG_QMI, "Device BAR Info pa: 0x%llx, size: 0x%lx\n",
++		   resp.bar_addr, ab->mem_len);
++
+ 	return 0;
+ out:
+ 	return ret;
+@@ -3200,6 +3206,23 @@ static const struct qmi_ops ath11k_qmi_o
+ 	.del_server = ath11k_qmi_ops_del_server,
+ };
+ 
++static int ath11k_wait_for_gic_msi(struct ath11k_base *ab)
++{
++	int timeout;
++
++	if (ab->hw_rev != ATH11K_HW_QCN6122_HW10)
++		return 0;
++
++	timeout = wait_event_timeout(ab->ipci.gic_msi_waitq,
++				     (ab->ipci.gic_enabled == 1),
++				     ATH11K_RCV_GIC_MSI_HDLR_DELAY);
++	if (timeout <= 0) {
++		ath11k_warn(ab, "Receive gic msi handler timed out\n");
++		return -ETIMEDOUT;
++	}
++	return 0;
++}
++
+ static void ath11k_qmi_driver_event_work(struct work_struct *work)
+ {
+ 	struct ath11k_qmi *qmi = container_of(work, struct ath11k_qmi,
+@@ -3269,6 +3292,13 @@ static void ath11k_qmi_driver_event_work
+ 				clear_bit(ATH11K_FLAG_CRASH_FLUSH,
+ 					  &ab->dev_flags);
+ 				clear_bit(ATH11K_FLAG_RECOVERY, &ab->dev_flags);
++				ret = ath11k_wait_for_gic_msi(ab);
++				if (ret) {
++					ath11k_warn(ab,
++					"Failed to get qgic handler for dev %d ret: %d\n",
++						    ab->hw_rev, ret);
++					break;
++				}
+ 				ret = ath11k_core_qmi_firmware_ready(ab);
+ 				if (ret) {
+ 					set_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags);
+@@ -3341,6 +3371,7 @@ int ath11k_qmi_init_service(struct ath11
+ 		return ret;
+ 	}
+ 
++	init_waitqueue_head(&ab->ipci.gic_msi_waitq);
+ 	return ret;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath11k/qmi.h
++++ b/drivers/net/wireless/ath/ath11k/qmi.h
+@@ -41,6 +41,7 @@
+ #define ATH11K_COLD_BOOT_FW_RESET_DELAY		(60 * HZ)
+ 
+ #define ATH11K_QMI_DEVICE_BAR_SIZE		0x200000
++#define ATH11K_RCV_GIC_MSI_HDLR_DELAY 		(3 * HZ)
+ 
+ struct ath11k_base;
+ 
