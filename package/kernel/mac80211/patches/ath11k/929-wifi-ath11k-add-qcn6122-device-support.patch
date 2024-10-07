@@ -1,0 +1,23 @@
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -37,6 +37,9 @@ static const struct of_device_id ath11k_
+ 	{ .compatible = "qcom,ipq5018-wifi",
+ 	  .data = (void *)ATH11K_HW_IPQ5018_HW10,
+ 	},
++	{ .compatible = "qcom,qcn6122-wifi",
++	  .data = (void *)ATH11K_HW_QCN6122_HW10,
++	},
+ 	{ }
+ };
+ 
+--- a/drivers/net/wireless/ath/ath11k/ce.c
++++ b/drivers/net/wireless/ath/ath11k/ce.c
+@@ -217,7 +217,7 @@ const struct ce_attr ath11k_host_ce_conf
+ 		.flags = CE_ATTR_FLAGS,
+ 		.src_nentries = 0,
+ 		.src_sz_max = 2048,
+-		.dest_nentries = 32,
++		.dest_nentries = 128,
+ 		.recv_cb = ath11k_htc_rx_completion_handler,
+ 	},
+ 

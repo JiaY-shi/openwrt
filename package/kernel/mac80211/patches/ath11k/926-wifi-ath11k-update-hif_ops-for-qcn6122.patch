@@ -1,0 +1,59 @@
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -789,6 +789,22 @@ static const struct ath11k_hif_ops ath11
+ 	.ce_irq_disable = ath11k_pci_disable_ce_irqs_except_wake_irq,
+ };
+ 
++static const struct ath11k_hif_ops ath11k_ahb_hif_ops_qcn6122 = {
++	.start = ath11k_pcic_start,
++	.stop = ath11k_pcic_stop,
++	.read32 = ath11k_pcic_read32,
++	.write32 = ath11k_pcic_write32,
++	.power_down = ath11k_ahb_power_down,
++	.power_up = ath11k_ahb_power_up,
++	.irq_enable = ath11k_pcic_ext_irq_enable,
++	.irq_disable = ath11k_pcic_ext_irq_disable,
++	.get_msi_address =  ath11k_pcic_get_msi_address,
++	.get_user_msi_vector = ath11k_pcic_get_user_msi_assignment,
++	.map_service_to_pipe = ath11k_pcic_map_service_to_pipe,
++	.get_ce_msi_idx = ath11k_pcic_get_ce_msi_idx,
++	.config_static_window = ath11k_pcic_config_static_window,
++};
++
+ static int ath11k_core_get_rproc(struct ath11k_base *ab)
+ {
+ 	struct ath11k_ahb *ab_ahb = ath11k_ahb_priv(ab);
+@@ -1133,6 +1149,10 @@ static int ath11k_ahb_probe(struct platf
+ 		hif_ops = &ath11k_ahb_hif_ops_wcn6750;
+ 		pci_ops = &ath11k_ahb_pci_ops;
+ 		break;
++	case ATH11K_HW_QCN6122_HW10:
++		hif_ops = &ath11k_ahb_hif_ops_qcn6122;
++		pci_ops = &ath11k_ahb_pci_ops;
++		break;
+ 	default:
+ 		dev_err(&pdev->dev, "unsupported device type %d\n", hw_rev);
+ 		return -EOPNOTSUPP;
+--- a/drivers/net/wireless/ath/ath11k/hif.h
++++ b/drivers/net/wireless/ath/ath11k/hif.h
+@@ -31,6 +31,7 @@ struct ath11k_hif_ops {
+ 	void (*ce_irq_enable)(struct ath11k_base *ab);
+ 	void (*ce_irq_disable)(struct ath11k_base *ab);
+ 	void (*get_ce_msi_idx)(struct ath11k_base *ab, u32 ce_id, u32 *msi_idx);
++	void (*config_static_window)(struct ath11k_base *ab);
+ };
+ 
+ static inline void ath11k_hif_ce_irq_enable(struct ath11k_base *ab)
+@@ -146,4 +147,12 @@ static inline void ath11k_get_ce_msi_idx
+ 		*msi_data_idx = ce_id;
+ }
+ 
++static inline void ath11k_hif_config_static_window(struct ath11k_base *ab)
++{
++	if (!ab->hif.ops->config_static_window)
++		return;
++
++	ab->hif.ops->config_static_window(ab);
++}
++
+ #endif /* _HIF_H_ */
