@@ -10,16 +10,17 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mac80211
 
-PKG_VERSION:=6.18.39
-PKG_RELEASE:=3
+PKG_UPSTREAM_VERSION:=7.2-rc6
+PKG_VERSION:=$(subst -rc,_rc,$(PKG_UPSTREAM_VERSION))
+PKG_RELEASE:=1
 PKG_LICENSE:=GPL-2.0-only
 PKG_LICENSE_FILES:=COPYING
 
-PKG_SOURCE_URL:=https://github.com/openwrt/backports/releases/download/backports-v$(PKG_VERSION)
-PKG_HASH:=8951c1e270d7c311432377bd50951cd1d5dee2b5fedf33d30db41aa8e428aeb0
+PKG_SOURCE_URL:=https://github.com/openwrt/backports/releases/download/backports-v$(PKG_UPSTREAM_VERSION)
+PKG_HASH:=2b5e797533f5c8ce358c94821c681b19a5b32212ffcebda87807e8a452b2f968
 
-PKG_SOURCE:=backports-$(PKG_VERSION).tar.zst
-PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(if $(BUILD_VARIANT),$(PKG_NAME)-$(BUILD_VARIANT)/)backports-$(PKG_VERSION)
+PKG_SOURCE:=backports-$(PKG_UPSTREAM_VERSION).tar.zst
+PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(if $(BUILD_VARIANT),$(PKG_NAME)-$(BUILD_VARIANT)/)backports-$(PKG_UPSTREAM_VERSION)
 PKG_BUILD_PARALLEL:=1
 
 PKG_MAINTAINER:=Felix Fietkau <nbd@nbd.name>
