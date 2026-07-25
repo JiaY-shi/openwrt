@@ -1,0 +1,27 @@
+#!/bin/sh
+
+[ "$ACTION" = add ] || exit 0
+[ -n "$DEVICENAME" ] || exit 0
+[ -L "/sys/class/net/$DEVICENAME/phy80211" ] || exit 0
+[ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = 1 ] || exit 0
+/etc/init.d/firewall enabled || exit 0
+
+reload_ppe_flowtable() {
+	local attempt
+
+	for attempt in 1 2 3 4 5 6 7 8 9 10; do
+		if [ -L "/sys/class/net/$DEVICENAME/master" ] &&
+		   fw4 -q print | grep -Fq "\"$DEVICENAME\""; then
+			lock /var/lock/ppe-flowtable
+			logger -t firewall \
+				"Reloading firewall after adding wireless device $DEVICENAME"
+			fw4 -q reload
+			lock -u /var/lock/ppe-flowtable
+			return
+		fi
+
+		sleep 1
+	done
+}
+
+reload_ppe_flowtable >/dev/null 2>&1 &
