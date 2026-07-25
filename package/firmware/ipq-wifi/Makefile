@@ -45,6 +45,7 @@ ALLWIFIBOARDS:= \
 	glinet_gl-ax1800 \
 	glinet_gl-axt1800 \
 	glinet_gl-b3000 \
+	glinet_gl-be6500 \
 	huawei_ap4050dn \
 	ignitenet_ss-w2-ac2600 \
 	iodata_wn-dax3000gr \
@@ -164,6 +165,8 @@ define ipq-wifi-install-one
     $(call ipq-wifi-install-one-to,$(1),$(2),QCA99X0/hw2.0),\
   $(if $(filter $(suffix $(1)),.IPQ5018 .ipq5018),\
     $(call ipq-wifi-install-ath11-one-to,$(1),$(2),IPQ5018/hw1.0),\
+  $(if $(filter $(suffix $(1)),.IPQ5332 .ipq5332),\
+    $(call ipq-wifi-install-ath12-one-to,$(1),$(2),IPQ5332/hw1.0),\
   $(if $(filter $(suffix $(1)),.IPQ6018 .ipq6018),\
     $(call ipq-wifi-install-ath11-one-to,$(1),$(2),IPQ6018/hw1.0),\
   $(if $(filter $(suffix $(1)),.IPQ8074 .ipq8074),\
@@ -175,7 +178,7 @@ define ipq-wifi-install-one
   $(if $(filter $(suffix $(1)),.QCN9274 .qcn9274),\
     $(call ipq-wifi-install-ath12-one-to,$(1),$(2),QCN9274/hw2.0),\
     $(error Unrecognized board-file suffix '$(suffix $(1))' for '$(1)')\
-  ))))))))))))
+  )))))))))))))
 
 endef
 # Blank line required at end of above define due to foreach context
@@ -243,6 +246,7 @@ $(eval $(call generate-ipq-wifi-package,elecom_wrc-x3000gs2,ELECOM WRC-X3000GS2)
 $(eval $(call generate-ipq-wifi-package,glinet_gl-ax1800,GL.iNet GL-AX1800))
 $(eval $(call generate-ipq-wifi-package,glinet_gl-axt1800,GL.iNet GL-AXT1800))
 $(eval $(call generate-ipq-wifi-package,glinet_gl-b3000,GL.iNet GL-B3000))
+$(eval $(call generate-ipq-wifi-package,glinet_gl-be6500,GL.iNet GL-BE6500))
 $(eval $(call generate-ipq-wifi-package,huawei_ap4050dn,Huawei AP4050DN))
 $(eval $(call generate-ipq-wifi-package,ignitenet_ss-w2-ac2600,Ignitenet SS-W2-AC2600))
 $(eval $(call generate-ipq-wifi-package,iodata_wn-dax3000gr,I-O DATA WN-DAX3000GR))
