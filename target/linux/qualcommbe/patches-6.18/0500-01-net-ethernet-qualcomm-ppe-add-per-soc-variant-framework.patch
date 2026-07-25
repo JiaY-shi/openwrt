@@ -2,24 +2,17 @@ From: Kenneth Kasilag <kenneth@kasilag.me>
 Date: Sun, 05 Jul 2026 00:00:00 +0000
 Subject: [PATCH] net: ethernet: qualcomm: ppe: add a per-SoC variant framework
 
-The PPE register block is largely shared across the HPPE (IPQ807x) and
-APPE (IPQ9574) generations: the SSDK drives both with one set of L2,
-L3 and flow accessors, and the table geometry (flow, host, VSI, XLT,
-MY_MAC, PUB_IP and next hop) is identical between them. A few things
-do differ - the PPPoE session table is deeper on APPE, the shaper
-runs off a faster clock, and the tunnel engine and virtual ports are
-APPE only - and the offload series that follows would otherwise bake
-the APPE values into shared code.
+The PPE register block is largely shared across the HPPE, APPE and MPPE
+generations. A few things differ: the PPPoE session table depth, the shaper
+clock, and availability of the tunnel engine and virtual ports.
 
-Collect the differences into per-SoC match data. Add struct
-ppe_variant, attach it through of_device_id.data, and read it in
-probe. Describe the IPQ9574. The shared table geometry stays as the
-compile-time PPE_*_ENTRIES macros; only the parameters that actually
-diverge between generations belong in the variant.
-
-No functional change for the IPQ9574.
+Collect the differences into per-SoC match data. Add struct ppe_variant,
+attach it through of_device_id.data, and describe both the IPQ9574 APPE and
+IPQ5332 MPPE. QCA SSDK builds IPQ5332 as MPPE with 64 PPPoE sessions, a
+200 MHz shaper clock, the tunnel engine and virtual ports.
 
 Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
+Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
@@ -31,7 +24,7 @@ Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
  #include <linux/platform_device.h>
  #include <linux/regmap.h>
  #include <linux/reset.h>
-@@ -195,6 +196,9 @@ static int qcom_ppe_probe(struct platfor
+@@ -230,6 +231,9 @@ static int qcom_ppe_probe(struct platfor
  		return dev_err_probe(dev, PTR_ERR(ppe_dev->regmap),
  				     "PPE initialize regmap failed\n");
  	ppe_dev->dev = dev;
@@ -39,22 +32,32 @@ Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
 +	if (!ppe_dev->variant)
 +		return -ENODEV;
  	ppe_dev->clk_rate = PPE_CLK_RATE;
- 	ppe_dev->num_ports = PPE_PORT_MAX;
+ 	ppe_dev->num_ports = num_ports;
  	ppe_dev->num_icc_paths = num_icc;
-@@ -234,8 +238,16 @@ static void qcom_ppe_remove(struct platf
+@@ -273,9 +277,25 @@ static void qcom_ppe_remove(struct platf
  	edma_destroy(ppe_dev);
  }
  
++static const struct ppe_variant ppe_variant_ipq5332 = {
++	.name			= "IPQ5332",
++	.num_pppoe_sessions	= 64,
++	.shaper_clock_khz	= 200000,
++	.has_tunnel_engine	= true,
++	.has_vports		= true,
++};
++
 +static const struct ppe_variant ppe_variant_ipq9574 = {
 +	.name			= "IPQ9574",
-+	.num_pppoe_sessions	= 64,	/* PPE_PPPOE_SESSION_ENTRIES */
++	.num_pppoe_sessions	= 64,
 +	.shaper_clock_khz	= 353000,
 +	.has_tunnel_engine	= true,
 +	.has_vports		= true,
 +};
 +
  static const struct of_device_id qcom_ppe_of_match[] = {
+-	{ .compatible = "qcom,ipq5332-ppe" },
 -	{ .compatible = "qcom,ipq9574-ppe" },
++	{ .compatible = "qcom,ipq5332-ppe", .data = &ppe_variant_ipq5332 },
 +	{ .compatible = "qcom,ipq9574-ppe", .data = &ppe_variant_ipq9574 },
  	{}
  };
