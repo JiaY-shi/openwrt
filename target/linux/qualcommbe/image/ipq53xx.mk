@@ -1,4 +1,3 @@
-
 define Build/fit-inline-rootfs
 	rm -f $@.dtb $@.kernel
 	cp $@ $@.kernel
@@ -40,3 +39,24 @@ define Device/ubnt_u7-pro-xgs
 		check-size | append-metadata
 endef
 TARGET_DEVICES += ubnt_u7-pro-xgs
+
+define Device/glinet_gl-be6500
+	$(call Device/FitImage)
+	$(call Device/UbiFit)
+	DEVICE_VENDOR := GL.iNet
+	DEVICE_MODEL := GL-BE6500
+	DEVICE_DTS_CONFIG := config@mi01.2
+	SOC := ipq5332
+	SUPPORTED_DEVICES += gl.inet,gl-be6500
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	KERNEL_INSTALL := 1
+	KERNEL_SIZE := 6096k
+	IMAGE_SIZE := 25344k
+	IMAGES += factory.bin
+	IMAGE/factory.bin := append-ubi | append-gl-metadata
+	DEVICE_PACKAGES := kmod-ath12k ath12k-firmware-ipq5332 \
+		ath12k-firmware-qcn9274 ipq-wifi-glinet_gl-be6500 \
+		kmod-hwmon-pwmfan kmod-qrtr-smd kmod-rtl837x-dsa
+endef
+TARGET_DEVICES += glinet_gl-be6500

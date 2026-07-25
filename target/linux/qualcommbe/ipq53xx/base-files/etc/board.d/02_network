@@ -9,10 +9,23 @@
 ipq53xx_setup_interfaces()
 {
 	local board="$1"
+	local lan_mac wan_mac
 
 	case "$board" in
 	ubnt,u7-pro-xgs)
 		ucidef_set_interface_lan "lan"
+		;;
+	gl.inet,gl-be6500)
+		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"
+		wan_mac=$(mtd_get_mac_binary "0:art" 0xa)
+		if [ -n "$wan_mac" ]; then
+			lan_mac=$(macaddr_add "$wan_mac" 1)
+			ucidef_set_network_device_mac "wan" "$wan_mac"
+			ucidef_set_network_device_mac "lan" "$lan_mac"
+			ucidef_set_interface_macaddr "wan" "$wan_mac"
+			ucidef_set_interface_macaddr "lan" "$lan_mac"
+			ucidef_set_label_macaddr "$wan_mac"
+		fi
 		;;
 	*)
 		echo "Unsupported hardware. Network interfaces not initialized"
