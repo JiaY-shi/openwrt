@@ -1,0 +1,97 @@
+#!/bin/sh
+
+[ "$ACTION" = add ] || exit 0
+[ -L "/sys/class/net/$DEVICENAME/phy80211" ] || exit 0
+
+set_irq_cpu() {
+	local irq="$1"
+	local cpu="$2"
+
+	[ -n "$irq" ] || return
+	[ -w "/proc/irq/$irq/smp_affinity_list" ] || return
+	echo "$cpu" > "/proc/irq/$irq/smp_affinity_list"
+}
+
+set_named_irq_cpu() {
+	local name="$1"
+	local cpu="$2"
+	local irq
+
+	irq="$(awk -v name="$name" '$0 ~ name {
+		gsub(":", "", $1)
+		print $1
+		exit
+	}' /proc/interrupts)"
+	set_irq_cpu "$irq" "$cpu"
+}
+
+# Spread the four EDMA receive queues and completion queues across all CPUs.
+ring=4
+while [ "$ring" -le 15 ]; do
+	set_named_irq_cpu "txcmpl_${ring}$" "$(((ring - 4) % 4))"
+	ring=$((ring + 1))
+done
+
+ring=12
+while [ "$ring" -le 15 ]; do
+	set_named_irq_cpu "rxdesc_${ring}$" "$((ring - 12))"
+	ring=$((ring + 1))
+done
+
+# IPQ5332 integrated radio data rings have stable interrupt names.
+ring=1
+while [ "$ring" -le 4 ]; do
+	set_named_irq_cpu "reo2host-destination-ring${ring}$" "$((ring - 1))"
+	ring=$((ring + 1))
+done
+
+ring=1
+while [ "$ring" -le 3 ]; do
+	set_named_irq_cpu "wbm2host-tx-completions-ring${ring}$" "$((ring - 1))"
+	ring=$((ring + 1))
+done
+
+set_named_irq_cpu 'reo2ost-exception$' 3
+set_named_irq_cpu 'wbm2host-rx-release$' 3
+set_named_irq_cpu 'reo2host-status$' 3
+
+# The backported PCI driver uses generic DP_EXT_IRQ names. Locate the QCN9274
+# by PCI ID and assign CE/DP vectors in their registration order.
+qcn_bdf=
+for pci_dev in /sys/bus/pci/devices/*; do
+	[ "$(cat "$pci_dev/vendor" 2>/dev/null)" = 0x17cb ] || continue
+	[ "$(cat "$pci_dev/device" 2>/dev/null)" = 0x1109 ] || continue
+	qcn_bdf="${pci_dev##*/}"
+	break
+done
+
+[ -n "$qcn_bdf" ] || exit 0
+
+assign_pci_irqs() {
+	local name="$1"
+	local even_cpu="$2"
+	local odd_cpu="$3"
+	local index=0
+	local irq
+	local cpu
+
+	for irq in $(awk -v tag="PCI-MSI-$qcn_bdf" -v name="$name" \
+		'index($0, tag) && index($0, name) {
+			gsub(":", "", $1)
+			print $1
+		}' /proc/interrupts); do
+		if [ "$((index % 2))" -eq 0 ]; then
+			cpu="$even_cpu"
+		else
+			cpu="$odd_cpu"
+		fi
+
+		set_irq_cpu "$irq" "$cpu"
+		index=$((index + 1))
+	done
+}
+
+# Keep CPU0/1 available for PPE/EDMA and system work while Wi-Fi data-plane
+# processing uses the otherwise lightly loaded CPU2/3.
+assign_pci_irqs ' ce' 2 3
+assign_pci_irqs 'DP_EXT_IRQ' 2 3
