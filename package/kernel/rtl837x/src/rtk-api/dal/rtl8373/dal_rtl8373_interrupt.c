@@ -127,7 +127,7 @@ rtk_api_ret_t dal_rtl8373_portLinkChgIMR_set(rtk_uint32 type, rtk_uint32 port, r
         else
             regData &= ~(1 << port);
 
-        if ((retVal = rtl8373_setAsicReg(RTL8373_IMR_INT_PORT_LINK_STS_CHG_ADDR, regData)) != RT_ERR_OK)
+        if ((retVal = rtl8373_setAsicReg(RTL8373_IMR_EXT_PORT_LINK_STS_CHG_ADDR, regData)) != RT_ERR_OK)
             return retVal;
     }
     return RT_ERR_OK;
