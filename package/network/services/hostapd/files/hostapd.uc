@@ -17,6 +17,7 @@ libubus.guard(ex_handler);
 hostapd.data.config = {};
 hostapd.data.pending_config = {};
 hostapd.data.apsta_freq = {};
+hostapd.data.restart_config = {};
 
 hostapd.data.file_fields = {
 	vlan_file: true,
@@ -370,17 +371,16 @@ function csa_timer_cancel(name)
 	}
 }
 
-function iface_restart(phydev, config, old_config)
+function iface_restart_remove(name, config, old_config)
 {
-	let phy = phydev.name;
-	let pending = hostapd.data.pending_config[phy];
+	let pending = hostapd.data.pending_config[name];
 
-	csa_timer_cancel(phy);
+	csa_timer_cancel(name);
 
 	if (pending)
 		pending.abort();
 
-	hostapd.remove_iface(phy);
+	hostapd.remove_iface(name);
 
 	let prev_bssid = {};
 	for (let bss in old_config?.bss ?? [])
@@ -389,6 +389,13 @@ function iface_restart(phydev, config, old_config)
 
 	iface_remove(old_config);
 	iface_remove(config);
+
+	return prev_bssid;
+}
+
+function iface_restart_start(phydev, config, prev_bssid)
+{
+	let phy = phydev.name;
 
 	if (!config.bss || !config.bss[0]) {
 		hostapd.printf(`No bss for phy ${phy}`);
@@ -423,6 +430,77 @@ function iface_restart(phydev, config, old_config)
 	}
 
 	iface_pending_init(phydev, config);
+}
+
+function iface_restart_flush(group)
+{
+	let restart = hostapd.data.restart_config[group];
+	if (!restart)
+		return;
+
+	delete hostapd.data.restart_config[group];
+
+	/* Stop every partner link before starting the first replacement link. */
+	for (let name, entry in restart.iface)
+		entry.prev_bssid = iface_restart_remove(name, entry.config,
+							entry.old_config);
+
+	for (let name, entry in restart.iface) {
+		let config = entry.config;
+		let phydev = phy_open(config.phy, config.radio_idx);
+		if (!phydev) {
+			hostapd.printf(`Failed to reopen phy ${config.phy}`);
+			continue;
+		}
+
+		iface_restart_start(phydev, config, entry.prev_bssid);
+	}
+}
+
+function iface_restart_cancel(name)
+{
+	for (let group, restart in hostapd.data.restart_config) {
+		if (!restart.iface[name])
+			continue;
+
+		delete restart.iface[name];
+		if (length(restart.iface))
+			continue;
+
+		restart.timer.cancel();
+		delete hostapd.data.restart_config[group];
+	}
+}
+
+function iface_config_is_mld(config)
+{
+	for (let bss in config?.bss)
+		if (bss.mld_ap)
+			return true;
+
+	return false;
+}
+
+function iface_restart(phydev, config, old_config)
+{
+	if (!iface_config_is_mld(config) && !iface_config_is_mld(old_config)) {
+		let prev_bssid = iface_restart_remove(phydev.name, config, old_config);
+		return iface_restart_start(phydev, config, prev_bssid);
+	}
+
+	let group = phydev.phy ?? config.phy ?? phydev.name;
+	let restart = hostapd.data.restart_config[group];
+	if (!restart) {
+		restart = { iface: {} };
+		hostapd.data.restart_config[group] = restart;
+	}
+
+	restart.iface[phydev.name] = { config, old_config };
+	if (restart.timer)
+		restart.timer.cancel();
+
+	/* netifd configures multi-radio links independently; collect partners. */
+	restart.timer = uloop.timer(2000, () => iface_restart_flush(group));
 }
 
 function array_to_obj(arr, key, start)
@@ -1073,6 +1151,7 @@ function iface_check_mld(phydev, name, config)
 function iface_config_remove(name, old_config)
 {
 	delete hostapd.data.apsta_freq[name];
+	iface_restart_cancel(name);
 	hostapd.remove_iface(name);
 	return iface_remove(old_config);
 }
