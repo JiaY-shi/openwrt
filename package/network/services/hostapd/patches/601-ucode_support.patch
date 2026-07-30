@@ -227,6 +227,15 @@ as adding/removing interfaces.
  {
 --- a/src/ap/hostapd.c
 +++ b/src/ap/hostapd.c
+@@ -66,7 +66,7 @@ static int hostapd_broadcast_wep_clear(s
+ #endif /* CONFIG_WEP */
+ static int setup_interface2(struct hostapd_iface *iface);
+ static void channel_list_update_timeout(void *eloop_ctx, void *timeout_ctx);
+-static void hostapd_cleanup_unused_mlds(struct hapd_interfaces *interfaces);
++void hostapd_cleanup_unused_mlds(struct hapd_interfaces *interfaces);
+ static void hostapd_interface_setup_failure_handler(void *eloop_ctx,
+ 						    void *timeout_ctx);
+ 
 @@ -263,6 +263,8 @@ int hostapd_reload_config(struct hostapd
  	struct hostapd_config *newconf, *oldconf;
  	size_t j;
