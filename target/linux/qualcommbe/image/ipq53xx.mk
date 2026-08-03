@@ -1,3 +1,16 @@
+DEVICE_VARS += BOOT_SCRIPT
+
+define Build/gl-ipq-factory-nand
+	$(CP) $(BOOT_SCRIPT) $(KDIR_TMP)/
+	$(TOPDIR)/scripts/mkits-qsdk-ipq-image.sh \
+		$@.its \
+		$(KDIR_TMP)/$(notdir $(BOOT_SCRIPT)) \
+		ubi \
+		$@
+	PATH=$(LINUX_DIR)/scripts/dtc:$(PATH) mkimage -f $@.its $@.new
+	@mv $@.new $@
+	$(RM) $@.its $(KDIR_TMP)/$(notdir $(BOOT_SCRIPT))
+endef
 
 define Build/fit-inline-rootfs
 	rm -f $@.dtb $@.kernel
@@ -40,3 +53,26 @@ define Device/ubnt_u7-pro-xgs
 		check-size | append-metadata
 endef
 TARGET_DEVICES += ubnt_u7-pro-xgs
+
+define Device/glinet_gl-be6500
+	$(call Device/FitImage)
+	$(call Device/UbiFit)
+	DEVICE_VENDOR := GL.iNet
+	DEVICE_MODEL := GL-BE6500
+	DEVICE_DTS_CONFIG := config@mi01.2
+	SOC := ipq5332
+	SUPPORTED_DEVICES += gl.inet,gl-be6500
+	BLOCKSIZE := 256k
+	PAGESIZE := 4096
+	KERNEL_INSTALL := 1
+	KERNEL_SIZE := 6096k
+	IMAGE_SIZE := 25344k
+	BOOT_SCRIPT := glinet_gl-be6500.bootscript
+	IMAGES += factory.bin
+	IMAGE/factory.bin := append-ubi | gl-ipq-factory-nand
+	DEVICE_PACKAGES := kmod-ath12k ath12k-firmware-ipq5332 \
+		ath12k-firmware-qcn9274 ipq-wifi-glinet_gl-be6500 \
+		kmod-hwmon-pwmfan kmod-qrtr-smd kmod-rtl837x-dsa \
+		kmod-usb-storage kmod-usb-storage-uas blockd usbutils
+endef
+TARGET_DEVICES += glinet_gl-be6500
