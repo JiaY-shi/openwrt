@@ -1,6 +1,6 @@
 From: Vignesh Viswanathan <vignesh.viswanathan@oss.qualcomm.com>
 Subject: remoteproc: qcom: add hexagon based WCSS secure PIL driver
-Date: Mon, 13 Jul 2026 12:02:19 +0530
+Date: Mon, 03 Aug 2026 16:16:09 +0530
 
 Add support to bring up hexagon based WCSS using secure PIL. All IPQxxxx
 SoCs support secure Peripheral Image Loading (PIL).
@@ -20,19 +20,22 @@ Signed-off-by: George Moussalem <george.moussalem@outlook.com>
 [ Dropped ipq5424 support ]
 Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
 Tested-by: Vignesh Viswanathan <vignesh.viswanathan@oss.qualcomm.com>
-Link: https://lore.kernel.org/r/20260713-rproc-v13-3-41011cbcda3e@oss.qualcomm.com
+Link: https://lore.kernel.org/r/20260803-rproc-v14-3-a1f87b0b0ad2@oss.qualcomm.com
 Signed-off-by: Varadarajan Narayanan <varadarajan.narayanan@oss.qualcomm.com>
+
+[ Backported to Linux 6.18 by retaining the qcom_scm_pas_* API and the
+  q6v5 start timeout in jiffies. ]
 ---
- drivers/remoteproc/Kconfig              |  19 ++
+ drivers/remoteproc/Kconfig              |  20 ++
  drivers/remoteproc/Makefile             |   1 +
- drivers/remoteproc/qcom_q6v5_wcss_sec.c | 325 ++++++++++++++++++++++++
+ drivers/remoteproc/qcom_q6v5_wcss_sec.c | 337 ++++++++++++++++++++++++++++++++
  include/linux/remoteproc.h              |   2 +
- 4 files changed, 347 insertions(+)
+ 4 files changed, 360 insertions(+)
  create mode 100644 drivers/remoteproc/qcom_q6v5_wcss_sec.c
 
 --- a/drivers/remoteproc/Kconfig
 +++ b/drivers/remoteproc/Kconfig
-@@ -254,6 +254,25 @@ config QCOM_Q6V5_WCSS
+@@ -254,6 +254,26 @@ config QCOM_Q6V5_WCSS
  	  Hexagon V5 based WCSS remote processors on e.g. IPQ8074.  This is
  	  a non-TrustZone wireless subsystem.
  
@@ -42,6 +45,7 @@ Signed-off-by: Varadarajan Narayanan <varadarajan.narayanan@oss.qualcomm.com>
 +	depends on QCOM_SMEM
 +	depends on RPMSG_QCOM_GLINK_SMEM || RPMSG_QCOM_GLINK_SMEM=n
 +	depends on RPMSG_QCOM_GLINK || RPMSG_QCOM_GLINK=n
++	depends on QCOM_AOSS_QMP || QCOM_AOSS_QMP=n
 +	select QCOM_MDT_LOADER
 +	select QCOM_PIL_INFO
 +	select QCOM_Q6V5_COMMON
@@ -70,7 +74,7 @@ Signed-off-by: Varadarajan Narayanan <varadarajan.narayanan@oss.qualcomm.com>
  qcom_wcnss_pil-y			+= qcom_wcnss.o
 --- /dev/null
 +++ b/drivers/remoteproc/qcom_q6v5_wcss_sec.c
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,337 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
@@ -129,8 +133,14 @@ Signed-off-by: Varadarajan Narayanan <varadarajan.narayanan@oss.qualcomm.com>
 +	}
 +
 +	ret = qcom_q6v5_wait_for_start(&wcss->q6, Q6_WAIT_TIMEOUT);
-+	if (ret == -ETIMEDOUT)
++
++	if (ret == -ETIMEDOUT) {
 +		dev_err(dev, "start timed out\n");
++		qcom_scm_pas_shutdown(wcss->desc->pasid);
++		goto unprepare;
++	}
++
++	return 0;
 +
 +unprepare:
 +	qcom_q6v5_unprepare(&wcss->q6);
@@ -144,15 +154,17 @@ Signed-off-by: Varadarajan Narayanan <varadarajan.narayanan@oss.qualcomm.com>
 +	struct device *dev = wcss->dev;
 +	int ret;
 +
++	ret = qcom_q6v5_request_stop(&wcss->q6, NULL);
++	if (ret == -ETIMEDOUT)
++		dev_err(dev, "timed out on wait\n");
++
 +	ret = qcom_scm_pas_shutdown(wcss->desc->pasid);
-+	if (ret) {
-+		dev_err(dev, "not able to shutdown\n");
-+		return ret;
-+	}
++	if (ret)
++		dev_err(dev, "Failed to shutdown %d\n", ret);
 +
 +	qcom_q6v5_unprepare(&wcss->q6);
 +
-+	return 0;
++	return ret;
 +}
 +
 +static void *wcss_sec_da_to_va(struct rproc *rproc, u64 da, size_t len,
@@ -164,6 +176,9 @@ Signed-off-by: Varadarajan Narayanan <varadarajan.narayanan@oss.qualcomm.com>
 +	offset = da - wcss->mem_reloc;
 +	if (offset < 0 || offset + len > wcss->mem_size)
 +		return NULL;
++
++	if (is_iomem)
++		*is_iomem = true;
 +
 +	return wcss->mem_region + offset;
 +}
@@ -207,8 +222,8 @@ Signed-off-by: Varadarajan Narayanan <varadarajan.narayanan@oss.qualcomm.com>
 +		return;
 +	}
 +
-+	if (offset + size < segment->size) {
-+		memcpy(dest, segment->io_ptr + offset, size);
++	if (offset + size <= segment->size) {
++		memcpy_fromio(dest, segment->io_ptr + offset, size);
 +	} else {
 +		iounmap(segment->io_ptr);
 +		segment->io_ptr = NULL;
@@ -284,9 +299,9 @@ Signed-off-by: Varadarajan Narayanan <varadarajan.narayanan@oss.qualcomm.com>
 +	wcss->mem_reloc = res.start;
 +	wcss->mem_size = resource_size(&res);
 +	wcss->mem_region = devm_ioremap_resource_wc(dev, &res);
-+	if (!wcss->mem_region) {
++	if (IS_ERR(wcss->mem_region)) {
 +		dev_err(dev, "unable to map memory region: %pR\n", &res);
-+		return -ENOMEM;
++		return PTR_ERR(wcss->mem_region);
 +	}
 +
 +	return 0;
@@ -340,14 +355,15 @@ Signed-off-by: Varadarajan Narayanan <varadarajan.narayanan@oss.qualcomm.com>
 +	qcom_add_glink_subdev(rproc, &wcss->glink_subdev, desc->ss_name);
 +	qcom_add_ssr_subdev(rproc, &wcss->ssr_subdev, desc->ss_name);
 +
-+	rproc->auto_boot = false;
++	rproc->auto_boot = desc->auto_boot;
 +	rproc->dump_conf = RPROC_COREDUMP_INLINE;
 +	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
 +
 +	ret = devm_rproc_add(&pdev->dev, rproc);
 +	if (ret) {
-+		qcom_remove_glink_subdev(rproc, &wcss->glink_subdev);
 +		qcom_remove_ssr_subdev(rproc, &wcss->ssr_subdev);
++		qcom_remove_glink_subdev(rproc, &wcss->glink_subdev);
++		qcom_q6v5_deinit(&wcss->q6);
 +		return ret;
 +	}
 +
@@ -361,8 +377,8 @@ Signed-off-by: Varadarajan Narayanan <varadarajan.narayanan@oss.qualcomm.com>
 +	struct rproc *rproc = platform_get_drvdata(pdev);
 +	struct wcss_sec *wcss = rproc->priv;
 +
-+	qcom_remove_glink_subdev(rproc, &wcss->glink_subdev);
 +	qcom_remove_ssr_subdev(rproc, &wcss->ssr_subdev);
++	qcom_remove_glink_subdev(rproc, &wcss->glink_subdev);
 +	qcom_q6v5_deinit(&wcss->q6);
 +}
 +
@@ -410,7 +426,7 @@ Signed-off-by: Varadarajan Narayanan <varadarajan.narayanan@oss.qualcomm.com>
  	dma_addr_t da;
  	size_t size;
  
-+	void *io_ptr;
++	void __iomem *io_ptr;
  	void *priv;
  	void (*dump)(struct rproc *rproc, struct rproc_dump_segment *segment,
  		     void *dest, size_t offset, size_t size);
