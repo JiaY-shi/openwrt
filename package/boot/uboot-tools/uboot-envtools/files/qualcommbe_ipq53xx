@@ -8,6 +8,7 @@ touch /etc/config/ubootenv
 board=$(board_name)
 
 case "$board" in
+qcom,ipq5332-ap-mi01.2 |\
 gl.inet,gl-be6500)
 	ubootenv_add_mtd "0:appsblenv" "0x0" "0x40000" "0x40000"
 	;;
