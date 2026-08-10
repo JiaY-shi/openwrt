@@ -30,6 +30,8 @@ gl_be6500_remove_oem_rootfs() {
 gl_be6500_do_upgrade_fit() {
 	local img="$1"
 	local mtdnum
+	local ubidev
+	local ubivol
 	local pos
 
 	# Stock GL.iNet firmware is a QSDK-style FIT image carrying a
@@ -52,7 +54,18 @@ gl_be6500_do_upgrade_fit() {
 		return 1
 	}
 
-	ubidetach -f -p "/dev/mtd$mtdnum" 2>/dev/null
+	# The running root filesystem sits on an UBI block device of this
+	# partition. Remove all UBI block devices before detaching,
+	# otherwise ubidetach and ubiformat will fail.
+	ubidev=$(nand_find_ubi "$CI_UBIPART")
+	if [ -n "$ubidev" ]; then
+		for ubivol in /dev/${ubidev}_*; do
+			[ -e "$ubivol" ] || continue
+			nand_remove_ubiblock "${ubivol##*/}" || return 1
+		done
+		ubidetach -p "/dev/mtd$mtdnum" || return 1
+	fi
+
 	ubiformat "/dev/mtd$mtdnum" -y -f /tmp/ubi.bin
 }
 
