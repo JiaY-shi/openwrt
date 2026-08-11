@@ -14,8 +14,12 @@ ipq53xx_setup_interfaces()
 	ubnt,u7-pro-xgs)
 		ucidef_set_interface_lan "lan"
 		;;
+	qcom,ipq5332-ap-mi01.2 |\
 	gl.inet,gl-be6500)
 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"
+		ucidef_set_country "CN"
+		ucidef_set_wireless "2g" "BE6500-2.4G" "psk2" "goodlife"
+		ucidef_set_wireless "5g" "BE6500-5G" "psk2" "goodlife"
 		;;
 	*)
 		echo "Unsupported hardware. Network interfaces not initialized"

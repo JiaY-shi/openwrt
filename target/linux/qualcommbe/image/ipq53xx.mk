@@ -61,7 +61,8 @@ define Device/glinet_gl-be6500
 	DEVICE_MODEL := GL-BE6500
 	DEVICE_DTS_CONFIG := config@mi01.2
 	SOC := ipq5332
-	SUPPORTED_DEVICES += gl.inet,gl-be6500
+	SUPPORTED_DEVICES += gl.inet,gl-be6500 gl-be6500 \
+		qcom,ipq5332-ap-mi01.2
 	BLOCKSIZE := 256k
 	PAGESIZE := 4096
 	KERNEL_INSTALL := 1
@@ -69,10 +70,11 @@ define Device/glinet_gl-be6500
 	IMAGE_SIZE := 25344k
 	BOOT_SCRIPT := glinet_gl-be6500.bootscript
 	IMAGES += factory.bin
-	IMAGE/factory.bin := append-ubi | gl-ipq-factory-nand
+	IMAGE/factory.bin := append-ubi | gl-ipq-factory-nand | append-metadata
 	DEVICE_PACKAGES := kmod-ath12k ath12k-firmware-ipq5332 \
 		ath12k-firmware-qcn9274 ipq-wifi-glinet_gl-be6500 \
 		kmod-hwmon-pwmfan kmod-qrtr-smd kmod-rtl837x-dsa \
-		kmod-usb-storage kmod-usb-storage-uas blockd usbutils
+		kmod-usb-storage kmod-usb-storage-uas blockd usbutils \
+		dumpimage
 endef
 TARGET_DEVICES += glinet_gl-be6500

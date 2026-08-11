@@ -14,7 +14,7 @@
 	#address-cells = <0x2>;
 	#size-cells = <0x2>;
 	model = "GL.iNet GL-BE6500";
-	compatible = "gl.inet,gl-be6500", "qcom,ipq5332";
+	compatible = "qcom,ipq5332-ap-mi01.2", "gl.inet,gl-be6500", "qcom,ipq5332";
 
 	usb_fixed_5p0: regulator-usb-5v {
 		compatible = "regulator-fixed";
