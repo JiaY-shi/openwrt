@@ -193,7 +193,7 @@ Signed-off-by: Daniel Golle <daniel@makrotopia.org>
  	int ret;
 --- a/drivers/net/phy/realtek/phy_patch_rtl826x.h
 +++ b/drivers/net/phy/realtek/phy_patch_rtl826x.h
-@@ -5,6 +5,10 @@
+@@ -5,7 +5,11 @@
  
  #include <linux/phy.h>
  
@@ -201,6 +201,7 @@ Signed-off-by: Daniel Golle <daniel@makrotopia.org>
 +int rtl826x_phy_patch_sds_set(struct phy_device *phydev, u32 sds_page, u32 sds_reg,
 +			      u32 data);
 +
+ int rtl8261c_phy_patch_db_init(struct phy_device *phydev);
  int rtl8261n_phy_patch_db_init(struct phy_device *phydev);
  int rtl8264b_phy_patch_db_init(struct phy_device *phydev);
  
