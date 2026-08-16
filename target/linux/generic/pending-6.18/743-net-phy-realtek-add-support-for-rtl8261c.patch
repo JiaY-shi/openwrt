@@ -1,0 +1,414 @@
+From: Chad Monroe <chad@monroe.io>
+Date: Wed, 14 Jan 2026 16:02:51 -0800
+Subject: [PATCH] net: phy: realtek: add support for RTL8261C/D-CG 10Gbps PHY
+
+The RTL8261C/D-CG is a Realtek 10Gbps copper PHY supporting 100M/1G/2.5G/5G/10G
+speeds via USXGMII interface. Requires firmware patching at init via patch
+mode entry/exit sequence. Work around MMD7 AN STAT1 not reporting
+autonegotiation capability correctly by forcing the Autoneg bit in
+get_features.
+
+Signed-off-by: Chad Monroe <chad@monroe.io>
+---
+ drivers/net/phy/realtek/phy_patch_rtl826x.c |   55 ++++
+ drivers/net/phy/realtek/phy_patch_rtl826x.h |    1 
+ drivers/net/phy/realtek/realtek_main.c      |  218 ++++++++++++++++++
+ 3 files changed, 273 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/phy/realtek/phy_patch_rtl826x.c
++++ b/drivers/net/phy/realtek/phy_patch_rtl826x.c
+@@ -273,6 +273,11 @@ out:
+ 	return ret;
+ }
+ 
++int rtl8261c_phy_patch_db_init(struct phy_device *phydev)
++{
++	return rtl826x_phy_patch_db_init(phydev, "rtl8261c.bin");
++}
++
+ int rtl8261n_phy_patch_db_init(struct phy_device *phydev)
+ {
+ 	return rtl826x_phy_patch_db_init(phydev, "rtl8261n.bin");
+@@ -283,5 +288,6 @@ int rtl8264b_phy_patch_db_init(struct ph
+ 	return rtl826x_phy_patch_db_init(phydev, "rtl8264b.bin");
+ }
+ 
++MODULE_FIRMWARE("rtl8261c.bin");
+ MODULE_FIRMWARE("rtl8261n.bin");
+ MODULE_FIRMWARE("rtl8264b.bin");
+--- a/drivers/net/phy/realtek/phy_patch_rtl826x.h
++++ b/drivers/net/phy/realtek/phy_patch_rtl826x.h
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/phy.h>
+ 
++int rtl8261c_phy_patch_db_init(struct phy_device *phydev);
+ int rtl8261n_phy_patch_db_init(struct phy_device *phydev);
+ int rtl8264b_phy_patch_db_init(struct phy_device *phydev);
+ 
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -163,6 +163,8 @@
+ 
+ #define RTL8224_SRAM_RTCT_FAULT(pair)		(0x8026 + (pair) * 4)
+ #define RTL8224_SRAM_RTCT_FAULT_BUSY		BIT(0)
++#define RTL8224_SRAM_RTCT_FAULT_MISMATCH_OPEN	BIT(1)
++#define RTL8224_SRAM_RTCT_FAULT_MISMATCH_SHORT	BIT(2)
+ #define RTL8224_SRAM_RTCT_FAULT_OPEN		BIT(3)
+ #define RTL8224_SRAM_RTCT_FAULT_SAME_SHORT	BIT(4)
+ #define RTL8224_SRAM_RTCT_FAULT_OK		BIT(5)
+@@ -206,6 +208,8 @@
+ #define RTL_8221B_VM_CG				0x001cc84a
+ #define RTL_8251B				0x001cc862
+ #define RTL_8261C				0x001cc890
++#define RTL_8261C_CG				0x001cc898
++#define RTL_8261D_CG				0x001cc898
+ #define RTL_8261N				0x001ccaf3
+ #define RTL_8264				0x001ccaf2
+ #define RTL_8264B				0x001cc813
+@@ -226,6 +230,40 @@
+ 
+ #define RTL826X_VND2_INSR			0xA43A
+ 
++/* RTL8261C-CG specific registers */
++#define RTL8261C_VND2_PHY_STATE			0xA420
++#define RTL8261C_VND2_PHY_STATE_READY_MASK	0x0003
++#define RTL8261C_VND2_PHY_STATE_READY		0x0003
++
++#define RTL8261C_VND2_PATCH_MODE_CTRL		0xB820
++#define RTL8261C_VND2_PATCH_MODE_STAT		0xB800
++#define RTL8261C_VND2_PATCH_CTRL		0xB82E
++
++#define RTL8261C_VND2_INDIRECT_ADDR		0xA436
++#define RTL8261C_VND2_INDIRECT_DATA		0xA438
++
++#define RTL8261C_VND1_RESET_CTRL		0x145
++
++#define RTL8261C_VND2_INER			0xA4D2
++#define   RTL8261C_VND2_INER_LINK		BIT(4)
++#define   RTL8261C_VND2_INER_PME		BIT(7)
++
++#define RTL8261C_VND2_INSR			0xA4D4
++
++#define RTL8261C_VND2_THERMAL_SENSOR_CTRL	0xB54C
++#define RTL8261C_THERMAL_SENSOR_VALID		BIT(0)
++#define RTL8261C_THERMAL_OVERTEMP_DWNSPD_EN	BIT(3)
++
++/* RTL8261C-CG indirect register addresses */
++#define RTL8261C_INDIRECT_PATCH_VER		0x801E
++#define RTL8261C_INDIRECT_PATCH_SETUP		0x8023
++
++/* RTL8261C-CG patch mode values */
++#define RTL8261C_PATCH_MODE_ENTER		BIT(4)
++#define RTL8261C_PATCH_MODE_READY		BIT(6)
++#define RTL8261C_PATCH_MODE_SETUP		0x0090
++#define RTL8261C_PATCH_SETUP_VAL		0x6100
++
+ MODULE_DESCRIPTION("Realtek PHY driver");
+ MODULE_AUTHOR("Johnson Leung");
+ MODULE_LICENSE("GPL");
+@@ -1816,6 +1854,10 @@ static int rtl8224_cable_test_result_tra
+ 	if (result & RTL8224_SRAM_RTCT_FAULT_CROSS_SHORT)
+ 		return ETHTOOL_A_CABLE_RESULT_CODE_CROSS_SHORT;
+ 
++	if (result & (RTL8224_SRAM_RTCT_FAULT_MISMATCH_OPEN |
++		      RTL8224_SRAM_RTCT_FAULT_MISMATCH_SHORT))
++		return ETHTOOL_A_CABLE_RESULT_CODE_IMPEDANCE_MISMATCH;
++
+ 	return ETHTOOL_A_CABLE_RESULT_CODE_UNSPEC;
+ }
+ 
+@@ -2510,6 +2552,155 @@ static int rtl826x_config_serdes_polarit
+ 			      mask, set);
+ }
+ 
++static int rtl8261c_cg_match_phy_device(struct phy_device *phydev,
++					const struct phy_driver *phydrv)
++{
++	return rtlgen_is_c45_match(phydev, RTL_8261C_CG, true);
++}
++
++static int rtl8261c_cg_probe(struct phy_device *phydev)
++{
++	int ret;
++
++	ret = rtl826x_probe(phydev);
++	if (ret < 0)
++		return ret;
++
++	ret = rtl8261c_phy_patch_db_init(phydev);
++	if (ret < 0)
++		return ret;
++
++	/* Datasheet requires bit 0 = 1 for the TSSR block to be valid. */
++	phy_modify_mmd(phydev, MDIO_MMD_VEND2, RTL8261C_VND2_THERMAL_SENSOR_CTRL,
++		       0, RTL8261C_THERMAL_OVERTEMP_DWNSPD_EN |
++		       RTL8261C_THERMAL_SENSOR_VALID);
++
++	return 0;
++}
++
++static int rtl8261c_cg_read_indirect(struct phy_device *phydev, u16 reg)
++{
++	int ret;
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND2, RTL8261C_VND2_INDIRECT_ADDR, reg);
++	if (ret < 0)
++		return ret;
++
++	return phy_read_mmd(phydev, MDIO_MMD_VEND2, RTL8261C_VND2_INDIRECT_DATA);
++}
++
++static int rtl8261c_cg_write_indirect(struct phy_device *phydev, u16 reg, u16 val)
++{
++	int ret;
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND2, RTL8261C_VND2_INDIRECT_ADDR, reg);
++	if (ret < 0)
++		return ret;
++
++	return phy_write_mmd(phydev, MDIO_MMD_VEND2, RTL8261C_VND2_INDIRECT_DATA, val);
++}
++
++static int rtl8261c_cg_config_init(struct phy_device *phydev)
++{
++	int ret, ret2, val;
++
++	/* Suppress PHY interrupt output before the hardware reset below.
++	 * The RTL8261C asserts its interrupt pin during power-on reset and
++	 * the VEND1 0x145 reset toggle, which races with phylib registering
++	 * phy_interrupt. If the IRQ fires first the kernel disables it
++	 * permanently. rtl8261c_cg_config_intr() will re-enable the interrupt
++	 * correctly once phylib is ready.
++	 */
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND2, RTL8261C_VND2_INER, 0);
++	if (ret < 0)
++		return ret;
++
++	ret = phy_clear_bits_mmd(phydev, MDIO_MMD_VEND1, 0xE1, BIT(0));
++	if (ret < 0)
++		return ret;
++
++	ret = phy_read_mmd(phydev, MDIO_MMD_VEND2, RTL8261C_VND2_PHY_STATE);
++	if (ret < 0)
++		return ret;
++
++	if ((ret & RTL8261C_VND2_PHY_STATE_READY_MASK) == 0) {
++		phy_set_bits_mmd(phydev, MDIO_MMD_VEND1,
++				 RTL8261C_VND1_RESET_CTRL, BIT(0));
++		phy_clear_bits_mmd(phydev, MDIO_MMD_VEND1,
++				   RTL8261C_VND1_RESET_CTRL, BIT(0));
++		mdelay(100);
++	}
++
++	ret = phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND2,
++					RTL8261C_VND2_PHY_STATE, val,
++					(val & RTL8261C_VND2_PHY_STATE_READY_MASK) ==
++					RTL8261C_VND2_PHY_STATE_READY,
++					10000, 1000000, false);
++	if (ret)
++		return ret;
++
++	val = rtl8261c_cg_read_indirect(phydev, RTL8261C_INDIRECT_PATCH_VER);
++	if (val < 0)
++		return val;
++	if (val == 0x1515)
++		goto configure;
++
++	ret = phy_set_bits_mmd(phydev, MDIO_MMD_VEND2,
++			       RTL8261C_VND2_PATCH_MODE_CTRL,
++			       RTL8261C_PATCH_MODE_ENTER);
++	if (ret < 0)
++		return ret;
++
++	ret = phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND2,
++					RTL8261C_VND2_PATCH_MODE_STAT, val,
++					val & RTL8261C_PATCH_MODE_READY,
++					10000, 1000000, false);
++	if (ret)
++		goto patch_exit;
++
++	ret = rtl8261c_cg_write_indirect(phydev, RTL8261C_INDIRECT_PATCH_SETUP,
++					 RTL8261C_PATCH_SETUP_VAL);
++	if (ret < 0)
++		goto patch_exit;
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND2, RTL8261C_VND2_PATCH_CTRL,
++			    0x0001);
++	if (ret < 0)
++		goto patch_exit;
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND2,
++			    RTL8261C_VND2_PATCH_MODE_CTRL,
++			    RTL8261C_PATCH_MODE_SETUP);
++	if (ret < 0)
++		goto patch_exit;
++
++	ret = rtlgen_phy_patch(phydev);
++
++patch_exit:
++	phy_clear_bits_mmd(phydev, MDIO_MMD_VEND2,
++			   RTL8261C_VND2_PATCH_CTRL, BIT(0));
++	rtl8261c_cg_write_indirect(phydev, RTL8261C_INDIRECT_PATCH_SETUP,
++				   0x0000);
++
++	phy_clear_bits_mmd(phydev, MDIO_MMD_VEND2,
++			   RTL8261C_VND2_PATCH_MODE_CTRL,
++			   RTL8261C_PATCH_MODE_ENTER);
++
++	ret2 = phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND2,
++					 RTL8261C_VND2_PATCH_MODE_STAT, val,
++					 !(val & RTL8261C_PATCH_MODE_READY),
++					 10000, 1000000, false);
++	if (ret)
++		return ret;
++	if (ret2)
++		return ret2;
++
++	rtl8261c_cg_write_indirect(phydev, RTL8261C_INDIRECT_PATCH_VER, 0x1515);
++
++configure:
++	return rtl826x_config_serdes_polarity(phydev);
++}
++
+ static int rtl826x_config_init(struct phy_device *phydev)
+ {
+ 	const unsigned int max_dereset_tries = 5;
+@@ -2584,6 +2775,24 @@ static int rtl826x_get_features(struct p
+ 	return 0;
+ }
+ 
++static int rtl8261c_cg_get_features(struct phy_device *phydev)
++{
++	int ret;
++
++	ret = rtl826x_get_features(phydev);
++	if (ret)
++		return ret;
++
++	/*
++	 * 10GBASE-T requires autonegotiation. the RTL8261C MMD7 AN STAT1 register does
++	 * not report AN capability correctly, causing genphy_c45_pma_read_abilities()
++	 * to not set the Autoneg bit in supported. force it here.
++	 */
++	linkmode_set_bit(ETHTOOL_LINK_MODE_Autoneg_BIT, phydev->supported);
++
++	return 0;
++}
++
+ static int rtl825xb_get_features(struct phy_device *phydev)
+ {
+ 	int ret;
+@@ -2757,6 +2966,86 @@ static irqreturn_t rtl826x_handle_interr
+ 	return IRQ_HANDLED;
+ }
+ 
++/* RTL8261C/D-CG INER/INSR live at MMD31 0xA4D2/0xA4D4 per datasheet;
++ * the rtl826x_* helpers target 0xA424/0xA43A used by older parts.
++ */
++static int rtl8261c_cg_config_intr(struct phy_device *phydev)
++{
++	u16 interrupts;
++	int ret;
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0xE1, 0);
++	if (ret < 0)
++		return ret;
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0xE3, 0);
++	if (ret < 0)
++		return ret;
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0xE4, 0x1);
++	if (ret < 0)
++		return ret;
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0xE0, 0x2F);
++	if (ret < 0)
++		return ret;
++
++	if (phydev->interrupts == PHY_INTERRUPT_ENABLED)
++		interrupts = RTL8261C_VND2_INER_LINK | RTL8261C_VND2_INER_PME;
++	else
++		interrupts = 0;
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND2, RTL8261C_VND2_INER, interrupts);
++	if (ret < 0)
++		return ret;
++
++	phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x2DC, 0xFF);
++
++	return phy_modify_mmd(phydev, MDIO_MMD_VEND1, 0xE1, BIT(0),
++			      phydev->interrupts == PHY_INTERRUPT_ENABLED);
++}
++
++static irqreturn_t rtl8261c_cg_handle_interrupt(struct phy_device *phydev)
++{
++	int irq_enabled;
++	int irq_status;
++
++	irq_status = phy_read_mmd(phydev, MDIO_MMD_VEND2, RTL8261C_VND2_INSR);
++	if (irq_status < 0) {
++		phy_error(phydev);
++		return IRQ_NONE;
++	}
++
++	if (phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x2DC, 0xFF) < 0) {
++		phy_error(phydev);
++		return IRQ_NONE;
++	}
++
++	irq_enabled = phy_read_mmd(phydev, MDIO_MMD_VEND2, RTL8261C_VND2_INER);
++	if (irq_enabled < 0) {
++		phy_error(phydev);
++		return IRQ_NONE;
++	}
++
++	if (!(irq_status & irq_enabled))
++		return IRQ_NONE;
++
++	if (irq_status & RTL8261C_VND2_INER_LINK) {
++		phydev_dbg(phydev, "RTK_PHY_INTR_LINK_CHANGE\n");
++		phy_mac_interrupt(phydev);
++	}
++
++	if (irq_status & RTL8261C_VND2_INER_PME) {
++		phydev_dbg(phydev, "RTK_PHY_INTR_WOL\n");
++
++		if (phy_clear_bits_mmd(phydev, MDIO_MMD_VEND2, 0xD8A2, BIT(15)) < 0)
++			return IRQ_NONE;
++
++		if (phy_set_bits_mmd(phydev, MDIO_MMD_VEND2, 0xD8A2, BIT(15)) < 0)
++			return IRQ_NONE;
++	}
++
++	return IRQ_HANDLED;
++}
++
+ static int rtl826x_set_wol(struct phy_device *phydev, struct ethtool_wolinfo *wol)
+ {
+ 	static const u32 cfg_reg[4] = {0xD8C6, 0xD8C8, 0xD8CA, 0xD8CC};
+@@ -3285,6 +3574,25 @@ static struct phy_driver realtek_drvs[]
+ 		.get_tunable    = rtl826x_get_tunable,
+ 		.set_tunable    = rtl826x_set_tunable,
+ 	}, {
++		.name           = "RTL8261C/D-CG 10Gbps PHY",
++		.config_init    = rtl8261c_cg_config_init,
++		.probe          = rtl8261c_cg_probe,
++		.get_features   = rtl8261c_cg_get_features,
++		.suspend        = rtl826x_suspend,
++		.resume         = rtlgen_c45_resume,
++		.config_aneg    = rtl826x_config_aneg,
++		.aneg_done      = genphy_c45_aneg_done,
++		.read_status    = rtl826x_read_status,
++		.config_intr    = rtl8261c_cg_config_intr,
++		.handle_interrupt = rtl8261c_cg_handle_interrupt,
++		.match_phy_device = rtl8261c_cg_match_phy_device,
++		.set_wol        = rtl826x_set_wol,
++		.get_wol        = rtl826x_get_wol,
++		.get_tunable    = rtl826x_get_tunable,
++		.set_tunable    = rtl826x_set_tunable,
++		.cable_test_start = rtl8224_cable_test_start,
++		.cable_test_get_status = rtl8224_cable_test_get_status,
++	}, {
+ 		PHY_ID_MATCH_EXACT(RTL_8264),
+ 		.name           = "RTL8264 10Gbps PHY",
+ 		.config_init    = rtl826x_config_init,
