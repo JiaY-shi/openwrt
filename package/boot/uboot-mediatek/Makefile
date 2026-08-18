@@ -1185,6 +1185,18 @@ define U-Boot/mt7988_asus_zenwifi-bt8
   DEPENDS:=+trusted-firmware-a-mt7988-spim-nand-ubi-ddr4
 endef
 
+define U-Boot/mt7988_glinet_gl-be14000
+  NAME:=GL.iNet GL-BE14000
+  BUILD_SUBTARGET:=filogic
+  BUILD_DEVICES:=glinet_gl-be14000-ubootmod
+  UBOOT_CONFIG:=mt7988a_glinet_gl-be14000
+  UBOOT_IMAGE:=u-boot.fip
+  BL2_BOOTDEV:=emmc
+  BL2_SOC:=mt7988
+  BL2_DDRTYPE:=comb-be14000
+  DEPENDS:=+trusted-firmware-a-mt7988-emmc-comb-be14000
+endef
+
 define U-Boot/mt7988_bananapi_bpi-r4-emmc
   NAME:=BananaPi BPi-R4
   BUILD_SUBTARGET:=filogic
@@ -1475,6 +1487,7 @@ UBOOT_TARGETS := \
 	mt7988_bananapi_bpi-r4-pro-8x-emmc \
 	mt7988_bananapi_bpi-r4-pro-8x-sdmmc \
 	mt7988_bananapi_bpi-r4-pro-8x-snand \
+	mt7988_glinet_gl-be14000 \
 	mt7988_rfb-spim-nand \
 	mt7988_rfb-snand \
 	mt7988_rfb-nor \
@@ -1520,6 +1533,13 @@ define Build/Prepare
 	$(CP) $(STAGING_DIR_IMAGE)/i2p5ge-phy-pmb.bin \
 		$(STAGING_DIR_IMAGE)/i2p5ge-phy-DSPBitTb.bin \
 		$(PKG_BUILD_DIR)/board/mediatek/mt7987/
+	$(CP) ./files/openwrt_logo.bmp $(PKG_BUILD_DIR)/board/mediatek/common/
+endef
+endif
+
+ifeq ($(BUILD_VARIANT),mt7988_glinet_gl-be14000)
+define Build/Prepare
+	$(call Build/Prepare/Default)
 	$(CP) ./files/openwrt_logo.bmp $(PKG_BUILD_DIR)/board/mediatek/common/
 endef
 endif
