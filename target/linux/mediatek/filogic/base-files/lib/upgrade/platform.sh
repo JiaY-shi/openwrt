@@ -173,6 +173,7 @@ platform_do_upgrade() {
 	cudy,wr3000h-v1-ubootmod|\
 	cudy,wr3000p-v1-ubootmod|\
 	gatonetworks,gdsp|\
+	glinet,gl-be10000-ubootmod|\
 	globitel,bt-r320|\
 	h3c,magic-nx30-pro|\
 	imou,hx21|\
@@ -424,6 +425,7 @@ platform_check_image() {
 	cudy,wr3000h-v1-ubootmod|\
 	cudy,wr3000p-v1-ubootmod|\
 	gatonetworks,gdsp|\
+	glinet,gl-be10000-ubootmod|\
 	globitel,bt-r320|\
 	h3c,magic-nx30-pro|\
 	jcg,q30-pro|\
