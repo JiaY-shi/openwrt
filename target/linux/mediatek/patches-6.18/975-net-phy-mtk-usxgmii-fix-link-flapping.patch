@@ -17,15 +17,19 @@ Signed-off-by: Pietro Ameruoso <p.ameruoso@live.it>
  drivers/net/pcs/pcs-mtk-usxgmii.c | 3 +++
  1 file changed, 3 insertions(+)
 
---- a/drivers/net/pcs/pcs-mtk-usxgmii.c
-+++ b/drivers/net/pcs/pcs-mtk-usxgmii.c
-@@ -360,6 +360,9 @@ static void mtk_usxgmii_pcs_link_up(stru
- {
+Index: linux-6.18.44/drivers/net/pcs/pcs-mtk-usxgmii.c
+===================================================================
+--- linux-6.18.44.orig/drivers/net/pcs/pcs-mtk-usxgmii.c
++++ linux-6.18.44/drivers/net/pcs/pcs-mtk-usxgmii.c
+@@ -423,6 +423,11 @@ static void mtk_usxgmii_pcs_link_up(stru
  	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
+ 	unsigned long timeout = jiffies + msecs_to_jiffies(10000);
  
-+	if (interface == PHY_INTERFACE_MODE_USXGMII)
++	if (interface == PHY_INTERFACE_MODE_USXGMII &&
++	    !of_property_read_bool(mpcs->dev->of_node,
++				   "mediatek,force-fixed-10g"))
 +		return;
 +
- 	/* Reconfiguring USXGMII to ensure the quality of the RX signal
- 	 * after the line side link up.
- 	 */
+ 	/* Only fixed 10G switch trunks need the extra post-link reset. */
+ 	if (of_property_read_bool(mpcs->dev->of_node,
+ 				  "mediatek,force-fixed-10g")) {
