@@ -25,7 +25,7 @@
 	};
 
 	memory@40000000 {
-		reg = <0x0 0x40000000 0x0 0x40000000>;
+		reg = <0x0 0x40000000 0x0 0x80000000>;
 		device_type = "memory";
 	};
 
@@ -460,11 +460,13 @@
 		reset-gpios = <&pio 34 GPIO_ACTIVE_LOW>;
 
 		/* the panel sits 180 degrees rotated against the BE10000 one,
-		 * so it needs the swap but neither inversion
+		 * so it needs the swap plus both inversions
 		 */
 		touchscreen-size-x = <240>;
 		touchscreen-size-y = <320>;
 		touchscreen-swapped-x-y;
+		touchscreen-inverted-x;
+		touchscreen-inverted-y;
 	};
 };
 
