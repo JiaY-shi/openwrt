@@ -1,0 +1,24 @@
+From: JiaY-shi <shi05275@163.com>
+Date: Sat, 19 Sep 2026 21:45:00 +0800
+Subject: [PATCH] net: ethernet: mtk_wed: fix HW RRO double free during SER
+
+mtk_wed_free_rx_buffer() already releases the HW RRO buffer through
+mtk_wed_hwrro_free_buffer().  Do not release it a second time from the
+SER RX reset path, otherwise a Wi-Fi recovery can pass a stale page
+pointer to __free_pages() and panic the kernel.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+ drivers/net/ethernet/mediatek/mtk_wed.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -1732,7 +1732,6 @@ mtk_wed_rx_reset(struct mtk_wed_device *
+ 				   false);
+ 	}
+ 	mtk_wed_free_rx_buffer(dev);
+-	mtk_wed_hwrro_free_buffer(dev);
+ 
+ 	return 0;
+ }
