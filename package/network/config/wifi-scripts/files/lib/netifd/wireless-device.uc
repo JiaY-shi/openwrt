@@ -196,6 +196,9 @@ function wdev_teardown_cb(wdev)
 	if (wdev.config_change)
 		wdev_config_init(wdev);
 
+	if (wdev.retry_setup_pending)
+		wdev_reset(wdev);
+
 	wdev.setup();
 }
 
@@ -399,6 +402,7 @@ function wdev_reset(wdev)
 {
 	wdev.retry = DEFAULT_RETRY;
 	delete wdev.retry_setup_failed;
+	delete wdev.retry_setup_pending;
 }
 
 function update(data)
@@ -438,13 +442,16 @@ function start()
 
 function retry_setup()
 {
-	if (this.delete)
+	if (this.delete || !this.autostart)
 		return;
 
-	if (this.state != "down" || !this.autostart)
+	if (this.state == "down")
+		return this.start();
+
+	if (this.state != "setup" && this.state != "teardown")
 		return;
 
-	this.start();
+	this.retry_setup_pending = true;
 }
 
 
