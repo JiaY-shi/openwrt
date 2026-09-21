@@ -1,0 +1,43 @@
+From: JiaY-shi <shi05275@163.com>
+Date: Sun, 16 Aug 2026 23:45:00 +0800
+Subject: [PATCH] AP: extend SA Query cleanup to legacy MLD reconnects
+
+The upstream SA Query timeout cleanup handles a station that still has an
+MLD profile. A former MLD station may instead reconnect as a legacy STA on
+an affiliated AP; its MLD profile has already been cleared by authentication,
+but the earlier partner link entries still need to be removed. Cover this
+case on an AP MLD while retaining the upstream full-client-state and
+Open/SAE restrictions so FT and FILS keys remain intact.
+
+Pass check_authorized=0 to ap_sta_re_add() because the timed-out SA Query
+permits replacing the old association. Clear the timeout after rebuilding
+the STA so the same association cannot trigger cleanup twice.
+
+Patch-dependency: 990-02-AP-fix-legacy-station-roaming-between-MLD-links.patch
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+ src/ap/ieee802_11.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -7619,15 +7619,16 @@ static void handle_assoc(struct hostapd_
+ 	 * association. FT and FILS keep keys in the state machine.
+ 	 */
+ 	if (hapd->conf->wpa && (sta->flags & WLAN_STA_MFP) &&
+-	    sta->sa_query_timed_out && ap_sta_is_mld(hapd, sta) &&
++	    sta->sa_query_timed_out && hapd->conf->mld_ap &&
+ 	    FULL_AP_CLIENT_STATE_SUPP(hapd->iface->drv_flags) &&
+ 	    (sta->auth_alg == WLAN_AUTH_OPEN ||
+ 	     sta->auth_alg == WLAN_AUTH_SAE)) {
+ 		ap_sta_free_wpa_sm(hapd, sta);
+-		if (ap_sta_re_add(hapd, sta) < 0) {
++		if (ap_sta_re_add(hapd, sta, 0) < 0) {
+ 			resp = WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
+ 			goto fail;
+ 		}
+ 		sta->flags |= WLAN_STA_AUTH;
++		ap_sta_set_sa_query_timeout(hapd, sta, 0);
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
