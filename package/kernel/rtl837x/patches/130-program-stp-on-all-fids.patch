@@ -1,0 +1,19 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] rtl8372n: program STP state on every FID
+
+Include the last FID when updating the per-FID MSTP state.  Upstream now
+steers BPDUs to the CPU with an L2 multicast entry for each VLAN.
+
+diff --git a/src/rtl8372n.c b/src/rtl8372n.c
+index 819ba9e..98a436b 100644
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -2510,7 +2510,7 @@ static void rtl8372n_port_stp_state_set(struct dsa_switch *ds, int port, u8 stat
+ 	}
+ 
+ 	/* Set the same status for the port on all the FIDs */
+-	for (int i = 0; i < RTL837x_FIDMAX; i++) {
++	for (int i = 0; i <= RTL837x_FIDMAX; i++) {
+ 		rtl837x_reg_bits_write(priv, RTL837X_MSPT_STATE_ADDR(i),
+ 				  RTL837X_MSTP_STATE_MASK(port), val
+ 				);

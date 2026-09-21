@@ -1,0 +1,224 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] rtl8372n: complete tag_8021q VLAN and bridge offload
+
+Track management and bridge PVIDs, program CPU membership for user VLANs,
+and use bridge VIDs for VLAN-unaware FDB/MDB entries and PPE flow offload.
+
+diff --git a/src/rtl8372n.c b/src/rtl8372n.c
+index 672934c..819ba9e 100644
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -236,7 +236,9 @@ struct rtl8372n {
+ 	struct rtl8372n_pcs pcs[RTL8372N_NUM_PORTS];
+ 	netdev_features_t csum_feature_backup;
+ 	bool pvid_enabled[RTL8372N_NUM_PORTS];
++	u16 pvid[RTL8372N_NUM_PORTS];
+ 	bool dsa_tag_8021q_vid[RTL8372N_VLAN_MAX+1];
++	u16 dsa_tag_pvid[RTL8372N_NUM_PORTS];
+ };
+ 
+ static int rtl8372n_detect(struct rtl837x_priv *priv)
+@@ -464,6 +466,7 @@ static int rtl8372n_set_pvid(struct rtl837x_priv *priv, int port,
+ 		return ret;
+ 
+ 	chip_data->pvid_enabled[port] = pvid_enabled;
++	chip_data->pvid[port] = vid;
+ 
+ 	/* If VLAN filtering is enabled and PVID is also enabled, we must
+ 	 * not drop any untagged or C-tagged frames. Make sure to update the
+@@ -1348,6 +1351,9 @@ static int rtl8372n_tag_8021q_vlan_add(struct dsa_switch *ds, int port,
+ 	struct rtl837x_priv *priv = ds->priv;
+ 	struct rtl8372n *chip_data = priv->chip_data;
+ 
++	if (!vid || vid > RTL8372N_VLAN_MAX)
++		return -EINVAL;
++
+ 	dev_dbg(priv->dev, "[%s]: port: %d, vid:%u, flags: %u\n", __func__, port, vid, flags);
+ 
+ 	// Set Port SVID
+@@ -1369,6 +1375,8 @@ static int rtl8372n_tag_8021q_vlan_add(struct dsa_switch *ds, int port,
+ 		goto fail_rollback;
+ 
+ 	chip_data->dsa_tag_8021q_vid[vid] = true;
++	if (flags & BRIDGE_VLAN_INFO_PVID)
++		chip_data->dsa_tag_pvid[port] = vid;
+ 	return 0;
+ 
+ fail_rollback:
+@@ -1392,6 +1400,9 @@ static int rtl8372n_tag_8021q_vlan_del(struct dsa_switch *ds, int port,
+ 
+ 	dev_dbg(priv->dev, "[%s]: port: %d, vid: %u\n", __func__, port, vid);
+ 
++	if (!vid || vid > RTL8372N_VLAN_MAX)
++		return -EINVAL;
++
+ 	ret = priv->ops->get_vlan_4k(priv, vid, &vlan4k);
+ 	if (ret)
+ 		return ret;
+@@ -1413,13 +1424,15 @@ static int rtl8372n_tag_8021q_vlan_del(struct dsa_switch *ds, int port,
+ 		return ret;
+ 	}
+ 
+-	chip_data->dsa_tag_8021q_vid[vid] = false;
++	chip_data->dsa_tag_8021q_vid[vid] = !!vlan4k.member;
+ 
+ 	// Clean Port SVID
+-	if (dsa_is_user_port(ds, port))
++	if (dsa_is_user_port(ds, port) && chip_data->dsa_tag_pvid[port] == vid) {
++		chip_data->dsa_tag_pvid[port] = 0;
+ 		ret = rtl837x_reg_bits_write(priv, RTL837X_VS_PORT_DFLT_SVID_ADDR(port),
+ 				  RTL837X_VS_PORT_DFLT_SVID_PORT_DFLT_SVID_MASK(port), 0
+ 				);
++	}
+ 	if (ret) {
+ 		dev_err(priv->dev,
+ 			"failed to clean port(%d) SVID %u\n",
+@@ -1818,6 +1831,11 @@ static int rtl8372n_vlan_add(struct dsa_switch *ds, int port,
+ 	if (untagged)
+ 		untag |= BIT(port);
+ 
++	if (dsa_is_user_port(ds, port)) {
++		member |= dsa_cpu_ports(ds);
++		untag &= ~dsa_cpu_ports(ds);
++	}
++
+ 	dev_dbg(priv->dev, "[%s] add VLAN %d on port %d, %s, %s\n", __func__,
+ 		vlan->vid, port, untagged ? "untagged" : "tagged",
+ 		pvid ? "PVID" : "no PVID");
+@@ -1870,6 +1888,7 @@ static int rtl8372n_vlan_del(struct dsa_switch *ds, int port,
+ {
+ 	int ret;
+ 	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
+ 
+ 	dev_dbg(priv->dev, "[%s]: port (%d) vid (%d)\n", __func__,
+ 							  port, vlan->vid);
+@@ -1883,6 +1902,11 @@ static int rtl8372n_vlan_del(struct dsa_switch *ds, int port,
+ 	vlan4k.member &= ~BIT(port);
+ 	vlan4k.untag &= ~BIT(port);
+ 
++	if (!(vlan4k.member & dsa_user_ports(ds))) {
++		vlan4k.member &= ~dsa_cpu_ports(ds);
++		vlan4k.untag &= ~dsa_cpu_ports(ds);
++	}
++
+ 	if (!vlan4k.member) {
+ 		vlan4k.vid = vlan->vid;
+ 		vlan4k.untag = 0;
+@@ -1906,6 +1930,9 @@ static int rtl8372n_vlan_del(struct dsa_switch *ds, int port,
+ 				 vlan->vid, ret);
+ 	}
+ 
++	if (chip_data->pvid[port] == vlan->vid)
++		return rtl8372n_set_pvid(priv, port, 0);
++
+ 	return 0;
+ }
+ 
+@@ -1919,6 +1946,14 @@ rtl8372n_port_bridge_join(struct dsa_switch *ds, int port,
+ 	struct dsa_port *dp;
+ 	u32 port_bitmap = 0;
+ 	int ret;
++	bool tag_8021q = rtl8372n_uses_tag_8021q(priv);
++
++	if (tag_8021q) {
++		ret = dsa_tag_8021q_bridge_join(ds, port, bridge,
++						 tx_fwd_offload, extack);
++		if (ret)
++			return ret;
++	}
+ 
+ 	/* Loop over all other ports than the current one */
+ 	dsa_switch_for_each_user_port(dp, ds) {
+@@ -2008,6 +2043,8 @@ fail_rollback:
+ 					dp->index, port, r);
+ 		}
+ 	}
++	if (tag_8021q)
++		dsa_tag_8021q_bridge_leave(ds, port, bridge);
+ 	return ret;
+ }
+ 
+@@ -2063,6 +2100,9 @@ rtl8372n_port_bridge_leave(struct dsa_switch *ds, int port,
+ 	 * The VLAN remains completely unchanged when the frame enters and exits
+ 	 */
+ 	rtl8372n_port_vlan_egr_tag_rewrite(priv, port, false);
++
++	if (rtl8372n_uses_tag_8021q(priv))
++		dsa_tag_8021q_bridge_leave(ds, port, bridge);
+ }
+ 
+ static int rtl8372n_port_enable(struct dsa_switch *ds, int port,
+@@ -2169,6 +2209,24 @@ rtl8372n_port_fdb_static_del(struct rtl837x_priv *priv,
+ 	return rtl837x_lut_del(priv, entry.addr);
+ }
+ 
++static u16 rtl8372n_db_vid(struct dsa_switch *ds, int port, u16 vid,
++			   struct dsa_db db)
++{
++	struct rtl837x_priv *priv = ds->priv;
++
++	if (vid || !rtl8372n_uses_tag_8021q(priv))
++		return vid;
++
++	switch (db.type) {
++	case DSA_DB_PORT:
++		return dsa_tag_8021q_standalone_vid(dsa_to_port(ds, port));
++	case DSA_DB_BRIDGE:
++		return dsa_tag_8021q_bridge_vid(db.bridge.num);
++	default:
++		return vid;
++	}
++}
++
+ static int
+ rtl8372n_port_fdb_add(struct dsa_switch *ds, int port,
+ 		    const unsigned char *addr, u16 vid,
+@@ -2184,6 +2242,7 @@ rtl8372n_port_fdb_add(struct dsa_switch *ds, int port,
+ 					db.type == DSA_DB_PORT ? "DSA_DB_PORT" : "DSA_DB_BRIDGE",
+ 					port, vid);
+ 
++	vid = rtl8372n_db_vid(ds, port, vid, db);
+ 	if (db.type == DSA_DB_BRIDGE && rtl8372n_uses_tag_8021q(priv))
+ 	{
+ 		/*
+@@ -2227,6 +2286,7 @@ rtl8372n_port_fdb_del(struct dsa_switch *ds, int port,
+ 	if (dsa_fdb_present_in_other_db(ds, port, addr, vid, db))
+ 		return 0;
+ 
++	vid = rtl8372n_db_vid(ds, port, vid, db);
+ 	if (db.type == DSA_DB_BRIDGE && rtl8372n_uses_tag_8021q(priv))
+ 	{
+ 		if (vid == 0)
+@@ -2287,6 +2347,7 @@ rtl8372n_port_mdb_add(struct dsa_switch *ds, int port,
+ 	u16 vid = mdb->vid;
+ 	struct rtl837x_lut_entry entry = {0};
+ 
++	vid = rtl8372n_db_vid(ds, port, vid, db);
+ 	memcpy(entry.mc.key.mac_addr, addr, ETH_ALEN);
+ 	entry.type = LUT_TYPE_L2_MC;
+ 	entry.mc.key.vid_fid = vid;
+@@ -2330,6 +2391,7 @@ rtl8372n_port_mdb_del(struct dsa_switch *ds, int port,
+ 	u16 vid = mdb->vid;
+ 	struct rtl837x_lut_entry entry = {0};
+ 
++	vid = rtl8372n_db_vid(ds, port, vid, db);
+ 	dev_dbg(priv->dev, "[%s]:mac:%02X:%02X:%02X:%02X:%02X:%02X port:%d vid:%04d\n", __func__,
+ 					addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
+ 					port, vid);
+diff --git a/src/rtl837x_mdio.c b/src/rtl837x_mdio.c
+index b2c3536..913902e 100644
+--- a/src/rtl837x_mdio.c
++++ b/src/rtl837x_mdio.c
+@@ -297,6 +297,11 @@ static int rtl837x_mdio_probe(struct mdio_device *mdiodev)
+ 	priv->ds->ops = var->ds_ops_mdio;
+ 	if (var->pl_mac_ops)
+ 		priv->ds->phylink_mac_ops = var->pl_mac_ops;
++	priv->ds->phys_mii_mask = GENMASK(7, 4);
++	priv->ds->configure_vlan_while_not_filtering = true;
++	priv->ds->untag_bridge_pvid = true;
++	priv->ds->fdb_isolation = true;
++	priv->ds->max_num_bridges = DSA_TAG_8021Q_MAX_NUM_BRIDGES;
+ 
+ 	ret = dsa_register_switch(priv->ds);
+ 	if (ret) {

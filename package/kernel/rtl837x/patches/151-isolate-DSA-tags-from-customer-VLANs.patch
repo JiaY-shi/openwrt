@@ -1,0 +1,208 @@
+From: JiaY-shi <shi05275@163.com>
+Date: Sat, 10 Oct 2026 17:10:00 +0800
+Subject: [PATCH] net: dsa: rtl8372n: isolate DSA tags from customer VLANs
+
+Use an 802.1ad outer tag for the internal DSA port/bridge identity and
+keep customer VLANs as 802.1Q. CPU-bound frames in VLAN-aware bridges
+must carry their customer PVID even when received untagged. Apply the
+customer VLAN table in both directions, preserving its member and
+tag/untag policy. VLAN-unaware ports keep the original customer format.
+
+Keep only CPU ports in the service role so untagged user frames use
+their independent per-port PVID rather than a global service VID.
+Restore failed tag-policy updates and keep the PVID cache consistent
+with its hardware rollback.
+Unregister the DSA VLAN context when post-registration setup fails,
+since the DSA core does not call teardown after a failed setup callback.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -236,6 +236,7 @@
+ 	struct rtl8372n_pcs pcs[RTL8372N_NUM_PORTS];
+ 	netdev_features_t csum_feature_backup;
+ 	bool pvid_enabled[RTL8372N_NUM_PORTS];
++	bool vlan_aware[RTL8372N_NUM_PORTS];
+ 	u16 pvid[RTL8372N_NUM_PORTS];
+ 	bool dsa_tag_8021q_vid[RTL8372N_VLAN_MAX+1];
+ 	u16 dsa_tag_pvid[RTL8372N_NUM_PORTS];
+@@ -472,7 +473,7 @@
+ 			  RTL837X_VLAN_PORT_PB_VLAN_PVID_MASK(port), vid
+ 			);
+ 	if (ret)
+-		return ret;
++		goto fail_rollback;
+ 
+ 	chip_data->pvid_enabled[port] = pvid_enabled;
+ 	chip_data->pvid[port] = vid;
+@@ -500,6 +501,15 @@
+ 				"failed to restore PVID of port %d: %d\n",
+ 				port, r);
+ 		chip_data->pvid_enabled[port] = pvid_enabled_bak;
++		chip_data->pvid[port] = pvid_bak;
++		if (dsa_port_is_vlan_filtering(dsa_to_port(ds, port))) {
++			r = rtl8372n_port_igr_drop_untagged(priv, port,
++							 !pvid_enabled_bak);
++			if (r)
++				dev_err(priv->dev,
++					"failed to restore port %d untagged policy: %d\n",
++					port, r);
++		}
+ 	}
+ 	return ret;
+ }
+@@ -1243,6 +1253,9 @@
+ 	return 0;
+ }
+ 
++static int rtl8372n_port_customer_vlan_mode(struct rtl837x_priv *priv,
++					  int port, bool vlan_aware);
++
+ static int rtl8372n_set_tag_8021q(struct dsa_switch *ds)
+ {
+ 	int ret;
+@@ -1283,7 +1296,7 @@
+ 		return ret;
+ 
+ 	// Set custom TPID
+-	ret = rtl837x_reg_write(priv, RTL837X_VS_GLB_CTRL_ADDR, ETH_P_8021Q);
++	ret = rtl837x_reg_write(priv, RTL837X_VS_GLB_CTRL_ADDR, ETH_P_8021AD);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1314,11 +1327,31 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = dsa_tag_8021q_register(ds, htons(ETH_P_8021Q));
++	/* The service tag identifies the DSA port/bridge. Customer tags
++	 * and PVIDs remain independent and use 802.1Q on user ports.
++	 */
++	ret = dsa_tag_8021q_register(ds, htons(ETH_P_8021AD));
+ 	if (ret)
+ 		return ret;
++	for (int port = 0; port < ds->num_ports; port++) {
++		struct rtl8372n *chip_data = priv->chip_data;
++
++		if (dsa_is_cpu_port(ds, port)) {
++			ret = rtl8372n_port_vlan_egr_tag_rewrite(priv, port, true);
++		} else if (dsa_is_user_port(ds, port)) {
++			ret = rtl8372n_port_customer_vlan_mode(priv, port,
++							chip_data->vlan_aware[port]);
++		} else {
++			continue;
++		}
++		if (ret)
++			goto unregister;
++	}
+ 
+ 	return 0;
++unregister:
++	dsa_tag_8021q_unregister(ds);
++	return ret;
+ }
+ 
+ static int rtl8372n_teardown_tag_8021q(struct dsa_switch *ds)
+@@ -1571,6 +1604,75 @@
+ 					);
+ }
+ 
++/* Preserve customer tags in unaware bridges. In aware bridges, apply
++ * the VLAN table's tag/untag policy in both directions and include the
++ * ingress PVID on CPU-bound frames. Only the CPU remains a service port.
++ */
++static int rtl8372n_port_customer_vlan_mode(struct rtl837x_priv *priv,
++					  int port, bool vlan_aware)
++{
++	struct dsa_switch *ds = priv->ds;
++	u32 cpu_keep[RTL8372N_NUM_PORTS] = {};
++	u32 old_keep, old_mode, keep;
++	struct dsa_port *cpu;
++	int ret, err;
++
++	if (!ds->tag_8021q_ctx || !dsa_is_user_port(ds, port))
++		return 0;
++	ret = rtl837x_reg_bits_read(priv, RTL837X_VLAN_PORT_EGR_KEEP_ADDR(port),
++				    RTL837X_VLAN_PORT_EGR_KEEP_PMSK_MASK(port),
++				    &old_keep);
++	if (ret)
++		return ret;
++	ret = rtl837x_reg_bits_read(priv, RTL837X_VLAN_PORT_EGR_TAG_ADDR(port),
++				    RTL837X_VLAN_PORT_EGR_TAG_MODE_MASK(port),
++				    &old_mode);
++	if (ret)
++		return ret;
++	dsa_switch_for_each_cpu_port(cpu, ds) {
++		ret = rtl837x_reg_bits_read(priv,
++				RTL837X_VLAN_PORT_EGR_KEEP_ADDR(cpu->index),
++				RTL837X_VLAN_PORT_EGR_KEEP_PMSK_MASK(cpu->index),
++				&cpu_keep[cpu->index]);
++		if (ret)
++			return ret;
++	}
++
++	keep = vlan_aware ? old_keep & ~dsa_cpu_ports(ds) :
++			    old_keep | dsa_cpu_ports(ds);
++	ret = rtl837x_reg_bits_write(priv, RTL837X_VLAN_PORT_EGR_KEEP_ADDR(port),
++				     RTL837X_VLAN_PORT_EGR_KEEP_PMSK_MASK(port), keep);
++	if (ret)
++		goto restore;
++	ret = rtl8372n_port_vlan_egr_tag_rewrite(priv, port, vlan_aware);
++	if (ret)
++		goto restore;
++	dsa_switch_for_each_cpu_port(cpu, ds) {
++		keep = vlan_aware ? cpu_keep[cpu->index] & ~BIT(port) :
++				    cpu_keep[cpu->index] | BIT(port);
++		ret = rtl837x_reg_bits_write(priv,
++				RTL837X_VLAN_PORT_EGR_KEEP_ADDR(cpu->index),
++				RTL837X_VLAN_PORT_EGR_KEEP_PMSK_MASK(cpu->index), keep);
++		if (ret)
++			goto restore;
++	}
++	return 0;
++
++restore:
++	err = rtl837x_reg_bits_write(priv, RTL837X_VLAN_PORT_EGR_KEEP_ADDR(port),
++				     RTL837X_VLAN_PORT_EGR_KEEP_PMSK_MASK(port), old_keep);
++	err |= rtl837x_reg_bits_write(priv, RTL837X_VLAN_PORT_EGR_TAG_ADDR(port),
++				      RTL837X_VLAN_PORT_EGR_TAG_MODE_MASK(port), old_mode);
++	dsa_switch_for_each_cpu_port(cpu, ds)
++		err |= rtl837x_reg_bits_write(priv,
++				RTL837X_VLAN_PORT_EGR_KEEP_ADDR(cpu->index),
++				RTL837X_VLAN_PORT_EGR_KEEP_PMSK_MASK(cpu->index),
++				cpu_keep[cpu->index]);
++	if (err)
++		dev_err(priv->dev, "failed to restore port %d VLAN tag policy\n", port);
++	return ret;
++}
++
+ static void rtl8372n_get_strings(struct dsa_switch *ds, int port, u32 stringset,
+ 			 uint8_t *data)
+ {
+@@ -1793,6 +1895,11 @@
+ 	if (ret)
+ 		goto fail_rollback;
+ 
++	ret = rtl8372n_port_customer_vlan_mode(priv, port, vlan_filtering);
++	if (ret)
++		goto fail_rollback;
++	chip_data->vlan_aware[port] = vlan_filtering;
++
+ 	return 0;
+ 
+ fail_rollback:
+@@ -1805,6 +1912,13 @@
+ 			dev_err(priv->dev,
+ 				"failed to restore ingress filter of port %d: %d\n",
+ 				port, r);
++		r = rtl8372n_port_igr_drop_untagged(priv, port,
++						 !!vlan_filter_bak &&
++						 !chip_data->pvid_enabled[port]);
++		if (r)
++			dev_err(priv->dev,
++				"failed to restore port %d untagged policy: %d\n",
++				port, r);
+ 	}
+ 	return ret;
+ }

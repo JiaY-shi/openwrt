@@ -1,0 +1,29 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] rtl8372n: preserve PHY enables when issuing software reset
+
+RST_GLB_CTRL_0 also contains GPHY_EN and CFG_EN_8051. Writing only the
+SW_CHIP_RST bit disables the internal PHYs, leaving Clause 45 discovery
+with zero device IDs and no supported link speeds. Preserve the register
+contents when asserting software reset through the no-ack write path.
+
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -315,11 +315,17 @@ static int rtl8372n_detect(struct rtl837x_priv *priv)
+ 
+ static int rtl8372n_soft_reset_chip(struct rtl837x_priv *priv)
+ {
++	int ret;
+ 	u32 tmp;
+ 
++	ret = rtl837x_reg_read(priv, RTL837X_RST_GLB_CTRL_0_ADDR, &tmp);
++	if (ret)
++		return ret;
++
++	/* Preserve the GPHY and 8051 enables sharing this register. */
+ 	if (priv->write_reg_noack)
+ 		priv->write_reg_noack(priv, RTL837X_RST_GLB_CTRL_0_ADDR,
+-			      FIELD_PREP(RTL837X_RST_GLB_CTRL_0_SW_CHIP_RST_MASK, 1));
++			      tmp | RTL837X_RST_GLB_CTRL_0_SW_CHIP_RST_MASK);
+ 	msleep(250);
+ 	return regmap_read_poll_timeout(priv->map, RTL837X_RST_GLB_CTRL_0_ADDR, tmp,
+ 					!(tmp & RTL837X_RST_GLB_CTRL_0_SW_CHIP_RST_MASK),
