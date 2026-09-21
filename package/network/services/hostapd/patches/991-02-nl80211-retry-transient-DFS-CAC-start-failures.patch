@@ -1,0 +1,182 @@
+From: JiaY-shi <shi05275@163.com>
+Date: Sun, 16 Aug 2026 23:10:00 +0800
+Subject: [PATCH] nl80211: retry transient DFS CAC start failures
+
+AP MLD reload can start the per-link HT coexistence scans and DFS setup in
+close succession.  The kernel rejects radar detection with -EBUSY while a
+scan or channel operation is still active.  A link that has not completed
+NL80211_CMD_ADD_LINK yet can similarly return -ENOLINK.  hostapd currently
+collapses the nl80211 errno to -1 and permanently disables the link after a
+single transient failure.
+
+Preserve the nl80211 errno and retry -EBUSY and -ENOLINK failures for up to
+15 seconds.  Also reject an invalid requested MLO link locally instead of
+silently sending the radar detection command without a link ID.  Keep all
+other failures fatal, and cancel pending retry work during interface
+teardown.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+ src/ap/dfs.c                    | 46 +++++++++++++++++++++++++++++++++---
+ src/ap/dfs.h                    |  1 +
+ src/ap/hostapd.h                |  1 +
+ src/ap/hw_features.c            |  2 ++
+ src/drivers/driver_nl80211.c    | 17 +++++++++----
+ 5 files changed, 60 insertions(+), 7 deletions(-)
+
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -10,6 +10,7 @@
+ #include "utils/includes.h"
+ 
+ #include "utils/common.h"
++#include "utils/eloop.h"
+ #include "common/ieee802_11_defs.h"
+ #include "common/hw_features_common.h"
+ #include "common/wpa_ctrl.h"
+@@ -25,6 +25,8 @@ enum dfs_channel_type {
+ 	DFS_NO_CAC_YET, /* radar-not-yet-available */
+ };
+ 
++#define DFS_CAC_START_RETRY_MAX 15
++
+ static struct hostapd_channel_data *
+ dfs_downgrade_bandwidth(struct hostapd_iface *iface, int *secondary_channel,
+ 			u8 *oper_centr_freq_seg0_idx,
+@@ -847,6 +849,31 @@ static unsigned int dfs_get_cac_time(str
+ }
+ 
+ 
++static void hostapd_dfs_cac_retry(void *eloop_data, void *user_data)
++{
++	struct hostapd_iface *iface = eloop_data;
++	int res;
++
++	if (iface->state != HAPD_IFACE_DFS || iface->cac_started) {
++		iface->num_dfs_cac_tries = 0;
++		return;
++	}
++
++	res = hostapd_handle_dfs(iface);
++	if (res > 0)
++		hostapd_setup_interface_complete(iface, 0);
++	else if (res < 0)
++		hostapd_setup_interface_complete(iface, -1);
++}
++
++
++void hostapd_dfs_cancel_cac_retry(struct hostapd_iface *iface)
++{
++	eloop_cancel_timeout(hostapd_dfs_cac_retry, iface, NULL);
++	iface->num_dfs_cac_tries = 0;
++}
++
++
+ /*
+  * Main DFS handler
+  * 1 - continue channel/ap setup
+@@ -938,8 +963,24 @@ int hostapd_handle_dfs(struct hostapd_if
+ 		hostapd_get_oper_centr_freq_seg1_idx(iface->conf),
+ 		dfs_use_radar_background(iface));
+ 
++	if (res == -EBUSY || res == -ENOLINK) {
++		iface->num_dfs_cac_tries++;
++		if (iface->num_dfs_cac_tries < DFS_CAC_START_RETRY_MAX) {
++			wpa_printf(MSG_INFO,
++				   "DFS CAC start temporarily unavailable (%d: %s), retry %d/%d",
++				   res, strerror(-res),
++				   iface->num_dfs_cac_tries,
++				   DFS_CAC_START_RETRY_MAX);
++			eloop_register_timeout(1, 0, hostapd_dfs_cac_retry,
++					       iface, NULL);
++			return 0;
++		}
++	}
++
++	iface->num_dfs_cac_tries = 0;
+ 	if (res) {
+-		wpa_printf(MSG_ERROR, "DFS start_dfs_cac() failed, %d", res);
++		wpa_printf(MSG_ERROR, "DFS start_dfs_cac() failed, %d (%s)",
++			   res, res < 0 ? strerror(-res) : "unknown error");
+ 		return -1;
+ 	}
+ 
+--- a/src/ap/dfs.h
++++ b/src/ap/dfs.h
+@@ -10,6 +10,7 @@
+ #define DFS_H
+ 
+ int hostapd_handle_dfs(struct hostapd_iface *iface);
++void hostapd_dfs_cancel_cac_retry(struct hostapd_iface *iface);
+ 
+ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 			     int ht_enabled, int chan_offset, int chan_width,
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -756,6 +756,7 @@ struct hostapd_iface {
+ 
+ 	void (*scan_cb)(struct hostapd_iface *iface);
+ 	int num_ht40_scan_tries;
++	int num_dfs_cac_tries;
+ 
+ 	struct dl_list sta_seen; /* struct hostapd_sta_info */
+ 	unsigned int num_sta_seen;
+--- a/src/ap/hw_features.c
++++ b/src/ap/hw_features.c
+@@ -21,6 +21,7 @@
+ #include "ieee802_11.h"
+ #include "beacon.h"
+ #include "hw_features.h"
++#include "dfs.h"
+ 
+ 
+ void hostapd_free_hw_features(struct hostapd_hw_modes *hw_features,
+@@ -612,5 +613,6 @@ void hostapd_stop_setup_timers(struct ho
+ {
+ 	eloop_cancel_timeout(ap_ht40_scan_retry, iface, NULL);
++	hostapd_dfs_cancel_cac_retry(iface);
+ }
+ 
+ 
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -11585,14 +11585,22 @@ static int nl80211_start_radar_detection
+ 		return -1;
+ 	}
+ 
+-	if (nl80211_link_valid(bss->valid_links, freq->link_id)) {
++	if (freq->link_id >= 0) {
++		if (!nl80211_link_valid(bss->valid_links, freq->link_id)) {
++			wpa_printf(MSG_ERROR,
++				   "nl80211: Cannot start radar detection on unavailable link_id=%d (valid_links=0x%04x)",
++				   freq->link_id, bss->valid_links);
++			nlmsg_free(msg);
++			return -ENOLINK;
++		}
++
+ 		wpa_printf(MSG_DEBUG,
+ 			   "nl80211: Radar detection (CAC) on link_id=%d",
+ 			   freq->link_id);
+ 
+-		if (nla_put_u8(msg, NL80211_ATTR_MLO_LINK_ID, freq->link_id)) {
++		if (nla_put_u8(msg, NL80211_ATTR_MLO_LINK_ID, freq->link_id)) {
+ 			nlmsg_free(msg);
+-			return -1;
++			return -ENOBUFS;
+ 		}
+ 	}
+ 
+@@ -11604,9 +11611,9 @@ static int nl80211_start_radar_detection
+ 		return 0;
+ 	}
+ 
+-	wpa_printf(MSG_DEBUG, "nl80211: Failed to start radar detection: "
++	wpa_printf(MSG_ERROR, "nl80211: Failed to start radar detection: "
+ 		   "%d (%s)", ret, strerror(-ret));
+-	return -1;
++	return ret;
+ }
+ 
+ #ifdef CONFIG_TDLS
+-- 
+2.51.0
