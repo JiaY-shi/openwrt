@@ -1,0 +1,44 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] rtl8372n: trap BPDUs and program STP on every FID
+
+IEEE link-local address 01:80:c2:00:00:00 must be delivered to the host
+bridge but must not be forwarded between switch ports.  Also include FID
+15 when updating the per-FID MSTP state.
+
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -2083,7 +2083,7 @@ static void rtl8372n_port_stp_state_set(
+ 	}
+ 
+ 	/* Set the same status for the port on all the FIDs */
+-	for (int i = 0; i < RTL837x_FIDMAX; i++) {
++	for (int i = 0; i <= RTL837x_FIDMAX; i++) {
+ 		rtl837x_reg_bits_write(priv, RTL8373_MSPT_STATE_ADDR(i),
+ 				  RTL8373_STP_STATE_MASK(port), val
+ 				);
+@@ -2527,6 +2527,25 @@ static int rtl8372n_setup(struct dsa_swi
+ 	if (ret)
+ 		return ret;
+ 
++	/* 01:80:c2:00:00:00 carries STP BPDUs. Trap it to the CPU and
++	 * disable VLAN and isolation leaking so a blocked topology cannot
++	 * circulate BPDUs in hardware.
++	 */
++	ret = rtl837x_reg_bits_write(priv, RTL8373_RMA_OP_CTRL_00_ADDR,
++			  RTL8373_RMA_OP_CTRL_00_RMA_ACT_00_MASK, 1);
++	if (ret)
++		return ret;
++
++	ret = rtl837x_reg_bits_write(priv, RTL8373_RMA_OP_CTRL_00_ADDR,
++			  RTL8373_RMA_OP_CTRL_00_VLAN_LEAKY_00_MASK, 0);
++	if (ret)
++		return ret;
++
++	ret = rtl837x_reg_bits_write(priv, RTL8373_RMA_OP_CTRL_00_ADDR,
++			  RTL8373_RMA_OP_CTRL_00_PISO_LEAKY_00_MASK, 0);
++	if (ret)
++		return ret;
++
+ 	rtnl_lock();
+ 	switch (priv->tag_proto) {
+ 	case DSA_TAG_PROTO_VSC73XX_8021Q:

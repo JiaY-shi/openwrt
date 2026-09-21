@@ -1,0 +1,587 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] net: dsa: rtl8372n: harden setup and restore DSA features
+
+Restore the DSA features provided by the vendor driver and make switch
+initialization fail when required register or PHY setup fails. Fix reset
+polarity handling and the RTL8224 regmap lock context as well.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -247,7 +247,10 @@ static int rtl8372n_detect(struct rtl837
+     switch_chip_t sw_chip;
+ 
+ 	ret = rtl837x_reg_read(priv, RTL8373_MODEL_NAME_INFO_ADDR, &val);
+-    dev_info(dev, "CHIP_ID: 0x%08x \n", val);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "CHIP_ID: 0x%08x \n", val);
+ 
+ 	switch (val >> 8)
+ 	{
+@@ -787,14 +790,18 @@ static const struct phylink_mac_ops rtl8
+ */
+ static int of_extra_init(struct dsa_switch *ds)
+ {
+-    struct rtl837x_priv *priv = ds->priv;
++	struct rtl837x_priv *priv = ds->priv;
+ 	struct device_node *np = ds->dev->of_node;
+ 	const __be32 *list;
+-	int size, data_len;
++	int size, data_len, ret;
+ 	u32 reg, mask, val;
+ 
+ 	list = of_get_property(np, "extra-init", &size);
+-	if (!list || !size) return 0;
++	if (!list || !size)
++		return 0;
++	if (size % (3 * sizeof(*list)))
++		return dev_err_probe(ds->dev, -EINVAL,
++				     "extra-init must contain register/mask/value triplets\n");
+ 
+ 	data_len = size / (3*sizeof(__be32));
+ 	for (int i=0; i<data_len; i++)
+@@ -807,7 +814,11 @@ static int of_extra_init(struct dsa_swit
+ 		list++;
+ 		dev_dbg(ds->dev, "of_extra_init: reg:0x%04X mask:0x%08X val:0x%08X\n", 
+ 							reg, mask, val);
+-		rtl837x_reg_bits_write(priv, reg, mask, val);
++		ret = rtl837x_reg_bits_write(priv, reg, mask, val);
++		if (ret)
++			return dev_err_probe(ds->dev, ret,
++					     "failed extra-init register 0x%04x\n",
++					     reg);
+ 	}
+ 	return 0;
+ }
+@@ -1427,6 +1438,38 @@ static void rtl8372n_get_ctrl_stats(stru
+ 	mutex_unlock(&priv->mib_lock);
+ }
+ 
++static void rtl8372n_get_pause_stats(struct dsa_switch *ds, int port,
++				      struct ethtool_pause_stats *pause_stats)
++{
++	struct rtl837x_priv *priv = ds->priv;
++
++	pause_stats->rx_pause_frames = 0;
++	pause_stats->tx_pause_frames = 0;
++
++	mutex_lock(&priv->mib_lock);
++	priv->ops->get_mib_counter(priv, port,
++		&priv->mib_counters[RTL837X_MIB_dot3InPauseFrames],
++		&pause_stats->rx_pause_frames);
++	priv->ops->get_mib_counter(priv, port,
++		&priv->mib_counters[RTL837X_MIB_dot3OutPauseFrames],
++		&pause_stats->tx_pause_frames);
++	mutex_unlock(&priv->mib_lock);
++}
++
++static int rtl8372n_set_ageing_time(struct dsa_switch *ds,
++				     unsigned int msecs)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	unsigned int secs = DIV_ROUND_UP(msecs, MSEC_PER_SEC);
++
++	secs = clamp_t(unsigned int, secs, 14, 800);
++
++	/* The RTL8372N SDK represents one second as five age-unit ticks. */
++	return rtl837x_reg_bits_write(priv, RTL8373_L2_AGE_CTRL_ADDR,
++				       RTL8373_L2_AGE_CTRL_AGE_UNIT_MASK,
++				       secs * 5);
++}
++
+ // TODO: Fail rollback
+ static int rtl8372n_vlan_filtering(struct dsa_switch *ds, int port,
+                                         bool vlan_filtering, struct netlink_ext_ack *extack)
+@@ -2055,9 +2098,11 @@ enum RTL8373_MSTP_STATE
+ #define RTL8373_STP_STATE_MASK(port) \
+ 	RTL8373_STP_STATE((port), GENMASK(1, 0))
+ 
+-static void rtl8372n_port_stp_state_set(struct dsa_switch *ds, int port, u8 state)
++static int __rtl8372n_port_stp_state_set(struct dsa_switch *ds, int port,
++					 u8 state)
+ {
+ 	struct rtl837x_priv *priv = ds->priv;
++	int ret;
+ 	u32 val;
+ 
+ 	dev_dbg(priv->dev, "[%s]: port(%d) stp_status(%d)\n", __func__,
+@@ -2079,15 +2124,31 @@ static void rtl8372n_port_stp_state_set(
+ 		break;
+ 	default:
+ 		dev_err(priv->dev, "[%s]: unknown bridge state requested\n", __func__);
+-		return;
++		return -EINVAL;
+ 	}
+ 
+ 	/* Set the same status for the port on all the FIDs */
+ 	for (int i = 0; i <= RTL837x_FIDMAX; i++) {
+-		rtl837x_reg_bits_write(priv, RTL8373_MSPT_STATE_ADDR(i),
++		ret = rtl837x_reg_bits_write(priv, RTL8373_MSPT_STATE_ADDR(i),
+ 				  RTL8373_STP_STATE_MASK(port), val
+ 				);
++		if (ret)
++			return ret;
+ 	}
++
++	return 0;
++}
++
++static void rtl8372n_port_stp_state_set(struct dsa_switch *ds, int port,
++					u8 state)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	int ret;
++
++	ret = __rtl8372n_port_stp_state_set(ds, port, state);
++	if (ret)
++		dev_err(priv->dev, "failed to set STP state %u on port %d: %d\n",
++			state, port, ret);
+ }
+ 
+ static int rtl8372n_setup(struct dsa_switch *ds)
+@@ -2144,54 +2205,82 @@ static int rtl8372n_setup(struct dsa_swi
+ 	chip_data->pcs[8].index = 8;
+ 
+ 	// set port 3 and port 8 as serdes port
+-	rtl837x_reg_bits_write(priv, RTL8373_SMI_MAC_TYPE_CTRL_ADDR, 
++	ret = rtl837x_reg_bits_write(priv, RTL8373_SMI_MAC_TYPE_CTRL_ADDR, 
+ 			 RTL8373_SMI_MAC_TYPE_CTRL_MAC_PORT8_TYPE_MASK | RTL8373_SMI_MAC_TYPE_CTRL_MAC_PORT3_TYPE_MASK,
+ 			 0
+ 			);
++	if (ret)
++		return ret;
+ 
+ 	// set port4-7 polling internal resolution reg
+-	rtl837x_reg_bits_write(priv, RTL8373_SMI_PORT_POLLING_SEL_ADDR, 
++	ret = rtl837x_reg_bits_write(priv, RTL8373_SMI_PORT_POLLING_SEL_ADDR, 
+ 			 RTL8373_SMI_PORT_POLLING_SEL_SMI_POLLING_SEL4_MASK | RTL8373_SMI_PORT_POLLING_SEL_SMI_POLLING_SEL5_MASK |
+ 			  RTL8373_SMI_PORT_POLLING_SEL_SMI_POLLING_SEL6_MASK | RTL8373_SMI_PORT_POLLING_SEL_SMI_POLLING_SEL7_MASK,
+ 			 0b1111
+ 			);
++	if (ret)
++		return ret;
+ 
+ 	// enable SMI0/1/2 MDC clock output
+-	rtl837x_reg_bits_write(priv, RTL8373_SMI_CTRL_ADDR,
++	ret = rtl837x_reg_bits_write(priv, RTL8373_SMI_CTRL_ADDR,
+ 			 RTL8373_SMI_CTRL_SMI0_MDC_EN_MASK | RTL8373_SMI_CTRL_SMI1_MDC_EN_MASK | RTL8373_SMI_CTRL_SMI2_MDC_EN_MASK,
+ 			 0b111
+ 			);
++	if (ret)
++		return ret;
+ 
+ 	//  puts "Power down PHY 4~7"
+-	rtl837x_phys_write_c45(priv, 0xF0, 31, 0xa610, 0x2858);
++	ret = rtl837x_phys_write_c45(priv, 0xF0, 31, 0xa610, 0x2858);
++	if (ret)
++		return ret;
+ 
+ 	if (of_property_read_bool(np, "sds0-rx-swap"))
+ 	{
+-		rtl837x_sds_reg_bits_write(priv, 0, 0, 0, 0x200, 1); //#SDS0RX PN swap
+-		rtl837x_sds_reg_bits_write(priv, 0, 6, 2, 0x2000, 1);
++		ret = rtl837x_sds_reg_bits_write(priv, 0, 0, 0, 0x200, 1); //#SDS0RX PN swap
++		if (ret)
++			return ret;
++		ret = rtl837x_sds_reg_bits_write(priv, 0, 6, 2, 0x2000, 1);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	if (of_property_read_bool(np, "sds0-tx-swap"))
+ 	{
+-		rtl837x_sds_reg_bits_write(priv, 0, 0, 0, 1 << 8, 1); //#SDS0RTX PN swap
+-		rtl837x_sds_reg_bits_write(priv, 0, 6, 2, 1 << 14, 1);
++		ret = rtl837x_sds_reg_bits_write(priv, 0, 0, 0, 1 << 8, 1); //#SDS0RTX PN swap
++		if (ret)
++			return ret;
++		ret = rtl837x_sds_reg_bits_write(priv, 0, 6, 2, 1 << 14, 1);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	if (of_property_read_bool(np, "sds1-rx-swap"))
+ 	{
+-		rtl837x_sds_reg_bits_write(priv, 1, 0, 0, 0x200, 1); //#SDS1RX PN swap
+-		rtl837x_sds_reg_bits_write(priv, 1, 6, 2, 0x2000, 1);
++		ret = rtl837x_sds_reg_bits_write(priv, 1, 0, 0, 0x200, 1); //#SDS1RX PN swap
++		if (ret)
++			return ret;
++		ret = rtl837x_sds_reg_bits_write(priv, 1, 6, 2, 0x2000, 1);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	if (of_property_read_bool(np, "sds1-tx-swap"))
+ 	{
+-		rtl837x_sds_reg_bits_write(priv, 1, 0, 0, 1 << 8, 1); //#SDS1TX PN swap
+-		rtl837x_sds_reg_bits_write(priv, 1, 6, 2, 1 << 14, 1);
++		ret = rtl837x_sds_reg_bits_write(priv, 1, 0, 0, 1 << 8, 1); //#SDS1TX PN swap
++		if (ret)
++			return ret;
++		ret = rtl837x_sds_reg_bits_write(priv, 1, 6, 2, 1 << 14, 1);
++		if (ret)
++			return ret;
+ 	}
+ 
+-	rtl837x_sds_reset_R(priv, 1);
++	ret = rtl837x_sds_reset_R(priv, 1);
++	if (ret)
++		return ret;
+ 	msleep(5);
+-	rtl837x_sds_reset_R(priv, 0);
++	ret = rtl837x_sds_reset_R(priv, 0);
++	if (ret)
++		return ret;
+ 	msleep(5);
+ 
+ 	/*
+@@ -2225,47 +2314,65 @@ static int rtl8372n_setup(struct dsa_swi
+ 	*/
+ 
+     // ##MDI reverse configuration for Demo Tap UP RJ45, RTL8366U/RTL8373N/RTL8372N
+-	if (of_property_read_bool(np, "phy-mdi-reverse"))
+-		rtl837x_reg_bits_write(priv, RTL8373_CFG_PHY_MDI_REVERSE_ADDR, 
++	if (of_property_read_bool(np, "phy-mdi-reverse")) {
++		ret = rtl837x_reg_bits_write(priv, RTL8373_CFG_PHY_MDI_REVERSE_ADDR,
+ 				  RTL8373_CFG_PHY_MDI_REVERSE_P0_MDI_REVERSE_MASK | RTL8373_CFG_PHY_MDI_REVERSE_P1_MDI_REVERSE_MASK |
+ 				   RTL8373_CFG_PHY_MDI_REVERSE_P2_MDI_REVERSE_MASK | RTL8373_CFG_PHY_MDI_REVERSE_P3_MDI_REVERSE_MASK,
+ 				  0xC
+ 				);
++		if (ret)
++			return ret;
++	}
+ 
+-	if (of_property_read_bool(np, "phy-tx-polarity-swap"))
+-		rtl837x_reg_bits_write(priv, RTL8373_CFG_PHY_TX_POLARITY_SWAP_ADDR,
++	if (of_property_read_bool(np, "phy-tx-polarity-swap")) {
++		ret = rtl837x_reg_bits_write(priv, RTL8373_CFG_PHY_TX_POLARITY_SWAP_ADDR,
+ 				 RTL8373_CFG_PHY_TX_POLARITY_SWAP_P0_TX_POLARITY_SWAP_MASK | RTL8373_CFG_PHY_TX_POLARITY_SWAP_P1_TX_POLARITY_SWAP_MASK |
+ 				  RTL8373_CFG_PHY_TX_POLARITY_SWAP_P2_TX_POLARITY_SWAP_MASK | RTL8373_CFG_PHY_TX_POLARITY_SWAP_P3_TX_POLARITY_SWAP_MASK,
+ 				 0x596A
+ 				); //#TX_POLARITY_SWAP
++		if (ret)
++			return ret;
++	}
+ 
+ 	//#cfg_FWD_INVLD_MAC_CTRL_EN,cfg_FWD_UNKN_OPCODE_EN
+-	rtl837x_reg_bits_write(priv, RTL8373_MAC_L2_GLOBAL_CTRL0_ADDR,
++	ret = rtl837x_reg_bits_write(priv, RTL8373_MAC_L2_GLOBAL_CTRL0_ADDR,
+ 			 RTL8373_MAC_L2_GLOBAL_CTRL0_FWD_UNKN_OPCODE_EN_MASK | RTL8373_MAC_L2_GLOBAL_CTRL0_FWD_INVLD_MAC_CTRL_EN_MASK,
+ 			 0b11
+ 			);
++	if (ret)
++		return ret;
+ 
+ 	// #RS_LINK_FAULT_INDI_OFF=1 disable link fault flag, resolve port4-port7 linkdown dsc expand issue
+-    rtl837x_reg_bits_write(priv, RTL8373_RS_LAYER_CONFIG_ADDR,
++	ret = rtl837x_reg_bits_write(priv, RTL8373_RS_LAYER_CONFIG_ADDR,
+ 		 RTL8373_RS_LAYER_CONFIG_RS_LINK_FAULT_INDI_OFF_MASK, 1
+ 		);
++	if (ret)
++		return ret;
+ 
+-	rtl837x_reg_bits_write(priv, RTL8373_DW8051_CFG_ADDR,
++	ret = rtl837x_reg_bits_write(priv, RTL8373_DW8051_CFG_ADDR,
+ 			 RTL8373_DW8051_CFG_DW8051_READY_MASK, 1
+ 			);
++	if (ret)
++		return ret;
+ 
+ #if defined(RTL837X_PHY_PATCH)
+ 	if (priv->chip_ver == 2)
+ 	{
+-		patch_phys_v008(priv, 0xf0);
+-		patch_phys_v008_rls_lockmain(priv, 0xf0);
++		ret = patch_phys_v008(priv, 0xf0);
++		if (ret)
++			return ret;
++		ret = patch_phys_v008_rls_lockmain(priv, 0xf0);
++		if (ret)
++			return ret;
+ 	}
+ #endif
+ 
+     //RTL8372/RTL8372N/RTL8366U set polling mask 0x1f8, port 3/8 from serdes need config bit8=1
+-    rtl837x_reg_bits_write(priv, RTL8373_SMI_GLB_CTRL_ADDR,
+-		 RTL8373_SMI_GLB_CTRL_SMI_POLLING_MASK_MASK, 0x1f8
++	ret = rtl837x_reg_bits_write(priv, RTL8373_SMI_GLB_CTRL_ADDR,
++			RTL8373_SMI_GLB_CTRL_SMI_POLLING_MASK_MASK, 0x1f8
+ 		);
++	if (ret)
++		return ret;
+ 	msleep(5);
+ 
+ 
+@@ -2284,7 +2391,9 @@ static int rtl8372n_setup(struct dsa_swi
+ 			return ret;
+ 	}
+ 
+-	of_extra_init(ds);
++	ret = of_extra_init(ds);
++	if (ret)
++		return ret;
+ 
+     ret = rtl8372n_setup_mdio(priv);
+ 	if(ret){
+@@ -2316,7 +2425,9 @@ static int rtl8372n_setup(struct dsa_swi
+ 		if (ret)
+ 			return ret;
+ 
+-		rtl8372n_port_stp_state_set(ds, port, BR_STATE_DISABLED);
++		ret = __rtl8372n_port_stp_state_set(ds, port, BR_STATE_DISABLED);
++		if (ret)
++			return ret;
+ 
+ 		/* Start with all port completely isolated */
+ 		ret = rtl8372n_port_set_isolation(priv, port, 0);
+@@ -2510,6 +2621,10 @@ static int rtl8372n_setup(struct dsa_swi
+ 	if (ret)
+ 		return ret;
+ 
++	ret = rtl8372n_set_ageing_time(ds, 300 * MSEC_PER_SEC);
++	if (ret)
++		return ret;
++
+ 	// Enable vlan egrFilter
+ 	ret = rtl837x_reg_bits_write(priv, RTL8373_VLAN_CTRL_ADDR,
+ 			  RTL8373_VLAN_CTRL_CVLAN_FILTER_MASK, 1
+@@ -2562,13 +2677,33 @@ static int rtl8372n_setup(struct dsa_swi
+ 	if (ret)
+ 		return ret;
+ 
+-    return 0;
++	return 0;
++}
++
++static void rtl8372n_teardown(struct dsa_switch *ds)
++{
++	struct rtl837x_priv *priv = ds->priv;
++
++	rtnl_lock();
++	switch (priv->tag_proto) {
++	case DSA_TAG_PROTO_VSC73XX_8021Q:
++	case DSA_TAG_PROTO_MXL862_8021Q:
++		rtl8372n_teardown_tag_8021q(ds);
++		break;
++	case DSA_TAG_PROTO_RTL8_4:
++		rtl8372n_teardown_tag_rtl(ds);
++		break;
++	default:
++		break;
++	}
++	rtnl_unlock();
+ }
+ 
+ static const struct dsa_switch_ops rtl8372n_switch_ops_mdio = {
+ 	.get_tag_protocol = rtl8372n_get_tag_protocol,
+ 	.change_tag_protocol = rtl8372n_change_tag_protocol,
+ 	.setup = rtl8372n_setup,
++	.teardown = rtl8372n_teardown,
+ 
+ 	.phylink_get_caps = rtl8372n_phylink_get_caps,
+ 
+@@ -2578,6 +2713,8 @@ static const struct dsa_switch_ops rtl83
+ 	.get_eth_phy_stats = rtl8372n_get_phy_stats,
+ 	.get_eth_mac_stats = rtl8372n_get_mac_stats,
+ 	.get_eth_ctrl_stats = rtl8372n_get_ctrl_stats,
++	.get_pause_stats = rtl8372n_get_pause_stats,
++	.set_ageing_time = rtl8372n_set_ageing_time,
+ 
+ 	.port_vlan_filtering = rtl8372n_vlan_filtering,
+ 	.port_vlan_add = rtl8372n_vlan_add,
+--- a/src/rtl837x_mdio.c
++++ b/src/rtl837x_mdio.c
+@@ -203,6 +203,7 @@ static int rtl837x_mdio_probe(struct mdi
+ 		mutex_init(&priv->map_8224_lock);
+ 
+ 		rc = rtl837x_rtl8224_regmap_config;
++		rc.lock_arg = priv;
+ 		priv->map_8224 = devm_regmap_init(dev, NULL, priv, &rc);
+ 		if (IS_ERR(priv->map_8224)) {
+ 			ret = PTR_ERR(priv->map_8224);
+@@ -227,7 +228,7 @@ static int rtl837x_mdio_probe(struct mdi
+ 
+ 	dev_set_drvdata(dev, priv);
+ 
+-	priv->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
++	priv->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(priv->reset)) {
+ 		dev_err(dev, "failed to get RESET GPIO\n");
+ 		ret = PTR_ERR(priv->reset);
+@@ -235,12 +236,12 @@ static int rtl837x_mdio_probe(struct mdi
+ 	}
+ 
+ 	if (priv->reset) {
+-		// This chip takes a long time to fully reset
+-		dev_dbg(dev, "asserted RESET\n");
+-		gpiod_set_value_cansleep(priv->reset, 0);
+-		usleep_range(50000, 51100);
++		/* Logical one asserts the reset regardless of GPIO polarity. */
++		dev_dbg(dev, "asserting RESET\n");
+ 		gpiod_set_value_cansleep(priv->reset, 1);
+ 		usleep_range(50000, 51100);
++		gpiod_set_value_cansleep(priv->reset, 0);
++		usleep_range(50000, 51100);
+ 		dev_dbg(dev, "deasserted RESET\n");
+ 	}
+ 
+@@ -294,6 +295,8 @@ static int rtl837x_mdio_probe(struct mdi
+ 	priv->ds->untag_bridge_pvid = true;
+ 	priv->ds->fdb_isolation = true;
+ 	priv->ds->max_num_bridges = DSA_TAG_8021Q_MAX_NUM_BRIDGES;
++	priv->ds->ageing_time_min = 14 * MSEC_PER_SEC;
++	priv->ds->ageing_time_max = 800 * MSEC_PER_SEC;
+ 	
+ 	ret = dsa_register_switch(priv->ds);
+ 	if (ret) {
+@@ -305,14 +308,19 @@ static int rtl837x_mdio_probe(struct mdi
+ 	if (of_property_read_bool(np, "gpio-controller"))
+ 	{
+ 		ret = rtl837x_gpiochip_init(priv);
+-		if (ret) 
++		if (ret) {
+ 			dev_err(priv->dev, "Failed to register gpiochip. ret = %d\n", ret);
++			goto err_unregister_switch;
++		}
+ 	}
+ #endif /* CONFIG_GPIOLIB */
+ 
+ 	rtl837x_debug_proc_init(priv);
+ 
+ 	return 0;
++
++err_unregister_switch:
++	dsa_unregister_switch(priv->ds);
+ err:
+ 	return ret;
+ }
+@@ -326,17 +334,11 @@ static void rtl837x_mdio_remove(struct m
+ 
+ 	rtl837x_debug_proc_deinit(priv);
+ 
+-	if (priv->ds->tag_8021q_ctx) {
+-		rtnl_lock();
+-		dsa_tag_8021q_unregister(priv->ds);
+-		rtnl_unlock();
+-	}
+-
+ 	dsa_unregister_switch(priv->ds);
+ 	
+ 	/* leave the device reset asserted */
+ 	if (priv->reset)
+-		gpiod_set_value(priv->reset, 1);
++		gpiod_set_value_cansleep(priv->reset, 1);
+ }
+ 
+ static void rtl837x_mdio_shutdown(struct mdio_device *mdiodev)
+--- a/src/rtl837x_intphy_patch.c
++++ b/src/rtl837x_intphy_patch.c
+@@ -1129,32 +1129,45 @@ static int patch_phy_v008_rls_lockmain(s
+ 
+ int patch_phys_v008(struct rtl837x_priv *priv, u16 phy_mask)
+ {
+-	int ret;
++	int ret, first_err = 0;
+ 	for (int p=0; p<8;p++)
+ 	{
+ 		if (!(phy_mask&BIT(p)))
+ 			continue;
+ 
+ 		ret = patch_phy_v008(priv, p);
+-		if (ret)
+-			dev_err(priv->dev, "Failed to apply patch_phy_v008 port(%d)\n", p);
++		if (ret) {
++			dev_err(priv->dev, "Failed to apply patch_phy_v008 port(%d): %d\n",
++				p, ret);
++			if (!first_err)
++				first_err = ret;
++		}
+ 	}
++	if (first_err)
++		return first_err;
++
+ 	dev_info(priv->dev, "Apply patch_phy_v008 Finish\n");
+ 	return 0;
+ }
+ 
+ int patch_phys_v008_rls_lockmain(struct rtl837x_priv *priv, u16 phy_mask)
+ {
+-	int ret;
++	int ret, first_err = 0;
+ 	for (int p=0; p<8;p++)
+ 	{
+ 		if (!(phy_mask&BIT(p)))
+ 			continue;
+ 
+ 		ret = patch_phy_v008_rls_lockmain(priv, p);
+-		if (ret)
++		if (ret) {
+ 			dev_err(priv->dev, "Failed to apply patch_phys_v008_rls_lockmain port(%d) %d\n", p, ret);
++			if (!first_err)
++				first_err = ret;
++		}
+ 	}
++	if (first_err)
++		return first_err;
++
+ 	dev_info(priv->dev, "Apply patch_phys_v008_rls_lockmain Finish\n");
+ 	return 0;
+ }
+@@ -1451,32 +1464,45 @@ static int patch_phy_v009_rls_lockmain(s
+ 
+ int patch_phys_v009(struct rtl837x_priv *priv, u16 phy_mask)
+ {
+-	int ret;
++	int ret, first_err = 0;
+ 	for (int p=0; p<8;p++)
+ 	{
+ 		if (!(phy_mask&BIT(p)))
+ 			continue;
+ 
+ 		ret = patch_phy_v009(priv, p);
+-		if (ret)
+-			dev_err(priv->dev, "Failed to apply patch_phy_v008 port(%d)\n", p);
++		if (ret) {
++			dev_err(priv->dev, "Failed to apply patch_phy_v009 port(%d): %d\n",
++				p, ret);
++			if (!first_err)
++				first_err = ret;
++		}
+ 	}
+-	dev_info(priv->dev, "Apply patch_phy_v008 Finish\n");
++	if (first_err)
++		return first_err;
++
++	dev_info(priv->dev, "Apply patch_phy_v009 Finish\n");
+ 	return 0;
+ }
+ 
+ int patch_phys_v009_rls_lockmain(struct rtl837x_priv *priv, u16 phy_mask)
+ {
+-	int ret;
++	int ret, first_err = 0;
+ 	for (int p=0; p<8;p++)
+ 	{
+ 		if (!(phy_mask&BIT(p)))
+ 			continue;
+ 
+ 		ret = patch_phy_v009_rls_lockmain(priv, p);
+-		if (ret)
+-			dev_err(priv->dev, "Failed to apply patch_phys_v008_rls_lockmain port(%d) %d\n", p, ret);
++		if (ret) {
++			dev_err(priv->dev, "Failed to apply patch_phys_v009_rls_lockmain port(%d) %d\n", p, ret);
++			if (!first_err)
++				first_err = ret;
++		}
+ 	}
+-	dev_info(priv->dev, "Apply patch_phys_v008_rls_lockmain Finish\n");
++	if (first_err)
++		return first_err;
++
++	dev_info(priv->dev, "Apply patch_phys_v009_rls_lockmain Finish\n");
+ 	return 0;
+ }

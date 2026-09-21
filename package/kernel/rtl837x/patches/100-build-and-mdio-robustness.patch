@@ -1,0 +1,72 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] rtl8372n: fix OpenWrt build and MDIO error handling
+
+Keep PHY patch helpers local to their translation unit and propagate
+errors returned by the underlying MDIO bus instead of folding negative
+errno values into register data.
+
+--- a/src/rtl837x_intphy_patch.c
++++ b/src/rtl837x_intphy_patch.c
+@@ -873,7 +873,7 @@ static int data_ram_write_8b(struct rtl8
+ 	return 0;
+ }
+ 
+-int patch_phy_v008(struct rtl837x_priv *priv, int phy)
++static int patch_phy_v008(struct rtl837x_priv *priv, int phy)
+ {
+ 	int ret=0, ret1=0;
+ 	u16 tmp16;
+@@ -1104,7 +1104,7 @@ int patch_phy_v008(struct rtl837x_priv *
+ 	return 0;
+ }
+ 
+-int patch_phy_v008_rls_lockmain(struct rtl837x_priv *priv, int phy)
++static int patch_phy_v008_rls_lockmain(struct rtl837x_priv *priv, int phy)
+ {
+ 	int ret=0, ret1=0;
+ 	u16 tmp16;
+@@ -1159,7 +1159,7 @@ int patch_phys_v008_rls_lockmain(struct
+ 	return 0;
+ }
+ 
+-int patch_phy_v009(struct rtl837x_priv *priv, int phy)
++static int patch_phy_v009(struct rtl837x_priv *priv, int phy)
+ {
+ 	int ret=0, ret1=0;
+ 	u16 tmp16;
+@@ -1425,7 +1425,7 @@ int patch_phy_v009(struct rtl837x_priv *
+ 	return 0;
+ }
+ 
+-int patch_phy_v009_rls_lockmain(struct rtl837x_priv *priv, int phy)
++static int patch_phy_v009_rls_lockmain(struct rtl837x_priv *priv, int phy)
+ {
+ 	int ret=0, ret1=0;
+ 	u16 tmp16;
+--- a/src/rtl837x_mdio.c
++++ b/src/rtl837x_mdio.c
+@@ -60,9 +60,16 @@ static int rtl837x_mdio_read(void *ctx,
+ 
+ 	val_l = bus->read(bus, priv->mdio_addr, MDC_MDIO_DATA_LOW);
+ 	val_h = bus->read(bus, priv->mdio_addr, MDC_MDIO_DATA_HIGH);
++	if (val_l < 0) {
++		ret = val_l;
++		goto out_unlock;
++	}
++	if (val_h < 0) {
++		ret = val_h;
++		goto out_unlock;
++	}
+ 
+-    *val = val_l & 0xffff;
+-    *val |= (val_h & 0xffff) << 16;
++	*val = (val_l & 0xffff) | ((val_h & 0xffff) << 16);
+ 	ret = 0;
+ 
+ out_unlock:
+@@ -359,4 +366,4 @@ mdio_module_driver(rtl837x_mdio_driver);
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("StarField Xu <air_jinkela@163.com>");
+-MODULE_DESCRIPTION("rtl8372n switch driver for MT7988");
++MODULE_DESCRIPTION("Realtek RTL8372N DSA switch driver");

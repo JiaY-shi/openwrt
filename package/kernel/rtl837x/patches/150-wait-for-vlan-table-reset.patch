@@ -1,0 +1,33 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] net: dsa: rtl8372n: wait for VLAN table reset
+
+The VLAN table reset is asynchronous.  Wait for the trigger bit to clear
+before programming the initial port and service VLAN state, otherwise a
+late reset completion can discard entries installed by DSA during setup.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -2154,6 +2154,7 @@ static int rtl8372n_setup(struct dsa_swi
+ {
+     int ret;
+     struct rtl837x_priv *priv = ds->priv;
++	u32 val;
+ 	struct device_node *np = priv->dev->of_node;
+ 	struct rtl8372n *chip_data = priv->chip_data;
+ 	struct dsa_port *dp;
+@@ -2405,6 +2406,13 @@ static int rtl8372n_setup(struct dsa_swi
+ 	ret = rtl837x_reg_bits_write(priv, RTL8373_VLAN_CTRL_ADDR, RTL8373_VLAN_CTRL_TABLE_RST_MASK, 1);
+ 	if (ret)
+ 		return ret;
++
++	ret = regmap_read_poll_timeout(priv->map, RTL8373_VLAN_CTRL_ADDR, val,
++				       !(val & RTL8373_VLAN_CTRL_TABLE_RST_MASK),
++				       10, 100000);
++	if (ret)
++		return dev_err_probe(priv->dev, ret,
++				     "VLAN table reset timed out\n");
+ 
+ 	dsa_switch_for_each_port(dp, ds) {
+ 		int port = dp->index;

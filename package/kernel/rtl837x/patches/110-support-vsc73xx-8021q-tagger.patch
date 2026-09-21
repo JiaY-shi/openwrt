@@ -1,0 +1,88 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] rtl8372n: support the VSC73XX 802.1Q tagger
+
+The IPQ5332 PPE can insert and match the standard VLAN header used by
+tag_8021q, but cannot generate the RTL8_4 proprietary header.  Reuse the
+switch's existing 802.1Q service-tag path with the VSC73XX tagger and
+make it the default protocol.
+
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -467,6 +467,12 @@ static int rtl8372n_get_mib_counter(stru
+ 	}
+ }
+ 
++static bool rtl8372n_uses_tag_8021q(struct rtl837x_priv *priv)
++{
++	return priv->tag_proto == DSA_TAG_PROTO_MXL862_8021Q ||
++	       priv->tag_proto == DSA_TAG_PROTO_VSC73XX_8021Q;
++}
++
+ static enum dsa_tag_protocol rtl8372n_get_tag_protocol(struct dsa_switch *ds,
+                                                         int port,
+                                                         enum dsa_tag_protocol mp)
+@@ -1157,6 +1163,7 @@ static int rtl8372n_change_tag_protocol(
+ 
+ 
+ 	switch (proto) {
++	case DSA_TAG_PROTO_VSC73XX_8021Q:
+ 	case DSA_TAG_PROTO_MXL862_8021Q:
+ 		ret = rtl8372n_teardown_tag_rtl(ds);
+ 		if (ret)
+@@ -1452,7 +1459,7 @@ static int rtl8372n_vlan_add(struct dsa_
+         return -EINVAL;
+     }
+ 
+-	if (vid_is_dsa_8021q(vid) && priv->tag_proto == DSA_TAG_PROTO_MXL862_8021Q)
++	if (vid_is_dsa_8021q(vid) && rtl8372n_uses_tag_8021q(priv))
+     {
+         NL_SET_ERR_MSG_MOD(extack, "Range 3072-4095 reserved for dsa_8021q operation");
+         return -EINVAL;
+@@ -1728,10 +1735,10 @@ rtl8372n_port_fdb_add(struct dsa_switch
+ 					db.type == DSA_DB_PORT ? "DSA_DB_PORT" : "DSA_DB_BRIDGE",
+ 					port, vid);
+ 
+-	if (db.type == DSA_DB_BRIDGE && priv->tag_proto == DSA_TAG_PROTO_MXL862_8021Q)
++	if (db.type == DSA_DB_BRIDGE && rtl8372n_uses_tag_8021q(priv))
+ 	{
+ 		/*
+-		* When the DSA tag protocol is DSA_TAG_PROTO_MXL862_8021Q, the L2 VLAN
++		* With a tag_8021q protocol, the L2 VLAN
+ 		* learned on the CPU port is the 802.1q DSA TAG rather than the port's own
+ 		* VLAN ID.
+ 		* We need add the correct fdb entry
+@@ -1772,7 +1779,7 @@ rtl8372n_port_fdb_del(struct dsa_switch
+ 	if (dsa_fdb_present_in_other_db(ds, port, addr, vid, db))
+ 		return 0;
+ 
+-	if (db.type == DSA_DB_BRIDGE && priv->tag_proto == DSA_TAG_PROTO_MXL862_8021Q)
++	if (db.type == DSA_DB_BRIDGE && rtl8372n_uses_tag_8021q(priv))
+ 	{
+ 		if (vid == 0)
+ 		{
+@@ -1811,7 +1818,7 @@ rtl8372n_port_fdb_dump(struct dsa_switch
+ 		if (entry.addr < i)
+ 			break;
+ 		/* We need to hide the dsa_8021q VLANs from the user. */
+-		if (vid_is_dsa_8021q(entry.uc.key.vid_fid) && priv->tag_proto == DSA_TAG_PROTO_MXL862_8021Q)
++		if (vid_is_dsa_8021q(entry.uc.key.vid_fid) && rtl8372n_uses_tag_8021q(priv))
+ 			entry.uc.key.vid_fid = 0;
+ 		ret = cb(entry.uc.key.mac_addr, entry.uc.key.vid_fid, entry.uc.is_static,
+ 				data);
+@@ -2453,6 +2460,7 @@ static int rtl8372n_setup(struct dsa_swi
+ 
+ 	rtnl_lock();
+ 	switch (priv->tag_proto) {
++	case DSA_TAG_PROTO_VSC73XX_8021Q:
+ 	case DSA_TAG_PROTO_MXL862_8021Q:
+ 		ret = rtl8372n_set_tag_8021q(ds);
+ 		break;
+@@ -2521,7 +2529,7 @@ static const struct rtl837x_ops rtl8372n
+ const struct rtl837x_variant rtl8372n_variant = {
+ 	.ds_ops_mdio = &rtl8372n_switch_ops_mdio,
+ 	.ops = &rtl8372n_ops,
+-	.def_tag_proto = DSA_TAG_PROTO_RTL8_4,
++	.def_tag_proto = DSA_TAG_PROTO_VSC73XX_8021Q,
+ 	.pl_mac_ops = &rtl8372n_phylink_mac_ops,
+ 	.have_8224 = false,
+ 	.chip_data_sz = sizeof(struct rtl8372n),
