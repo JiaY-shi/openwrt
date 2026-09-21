@@ -1,0 +1,162 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] remoteproc: qcom: retain secure WCSS lifecycle fixes
+
+The generic 830-03/04 patches now provide the secure WCSS driver and
+split firmware support. Keep the local v14 start/stop lifecycle, I/O
+access, reserved-memory mapping and probe cleanup fixes as an incremental
+patch instead of creating the driver again. Preserve the generic TME-L
+and split firmware paths.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/remoteproc/Kconfig
++++ b/drivers/remoteproc/Kconfig
+@@ -260,6 +260,7 @@
+ 	depends on QCOM_SMEM
+ 	depends on RPMSG_QCOM_GLINK_SMEM || RPMSG_QCOM_GLINK_SMEM=n
+ 	depends on RPMSG_QCOM_GLINK || RPMSG_QCOM_GLINK=n
++	depends on QCOM_AOSS_QMP || QCOM_AOSS_QMP=n
+ 	select QCOM_MDT_LOADER
+ 	select QCOM_PIL_INFO
+ 	select QCOM_Q6V5_COMMON
+--- a/drivers/remoteproc/qcom_q6v5_wcss_sec.c
++++ b/drivers/remoteproc/qcom_q6v5_wcss_sec.c
+@@ -86,8 +86,14 @@
+ 	}
+ 
+ 	ret = qcom_q6v5_wait_for_start(&wcss->q6, Q6_WAIT_TIMEOUT);
+-	if (ret == -ETIMEDOUT)
++	if (ret == -ETIMEDOUT) {
+ 		dev_err(dev, "start timed out\n");
++		if (!wcss->desc->use_tmelcom)
++			qcom_scm_pas_shutdown(wcss->desc->pasid);
++		goto unprepare;
++	}
++
++	return 0;
+ 
+ unprepare:
+ 	qcom_q6v5_unprepare(&wcss->q6);
+@@ -100,6 +106,10 @@
+ 	struct wcss_sec *wcss = rproc->priv;
+ 	struct device *dev = wcss->dev;
+ 	int ret;
++
++	ret = qcom_q6v5_request_stop(&wcss->q6, NULL);
++	if (ret == -ETIMEDOUT)
++		dev_err(dev, "timed out on wait\n");
+ 
+ 	if (wcss->desc->use_tmelcom) {
+ 		struct tmel_sec_auth tsa = {0};
+@@ -113,14 +123,13 @@
+ 	} else {
+ 		ret = qcom_scm_pas_shutdown(wcss->desc->pasid);
+ 		if (ret) {
+-			dev_err(dev, "not able to shutdown\n");
+-			return ret;
++			dev_err(dev, "Failed to shutdown %d\n", ret);
+ 		}
+ 	}
+ 
+ 	qcom_q6v5_unprepare(&wcss->q6);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static void *wcss_sec_da_to_va(struct rproc *rproc, u64 da, size_t len,
+@@ -132,6 +141,9 @@
+ 	offset = da - wcss->mem_reloc;
+ 	if (offset < 0 || offset + len > wcss->mem_size)
+ 		return NULL;
++
++	if (is_iomem)
++		*is_iomem = true;
+ 
+ 	return wcss->mem_region + offset;
+ }
+@@ -217,8 +229,8 @@
+ 		return;
+ 	}
+ 
+-	if (offset + size < segment->size) {
+-		memcpy(dest, segment->io_ptr + offset, size);
++	if (offset + size <= segment->size) {
++		memcpy_fromio(dest, segment->io_ptr + offset, size);
+ 	} else {
+ 		iounmap(segment->io_ptr);
+ 		segment->io_ptr = NULL;
+@@ -280,32 +292,23 @@
+ 
+ static int wcss_sec_alloc_memory_region(struct wcss_sec *wcss)
+ {
+-	struct reserved_mem *rmem = NULL;
+-	struct device_node *node;
+ 	struct device *dev = wcss->dev;
+-
+-	node = of_parse_phandle(dev->of_node, "memory-region", 0);
+-	if (!node) {
+-		dev_err(dev, "can't find phandle memory-region\n");
+-		return -EINVAL;
+-	}
+-
+-	rmem = of_reserved_mem_lookup(node);
+-	of_node_put(node);
+-
+-	if (!rmem) {
+-		dev_err(dev, "unable to acquire memory-region\n");
+-		return -EINVAL;
+-	}
+-
+-	wcss->mem_phys = rmem->base;
+-	wcss->mem_reloc = rmem->base;
+-	wcss->mem_size = rmem->size;
+-	wcss->mem_region = devm_ioremap_wc(dev, wcss->mem_phys, wcss->mem_size);
+-	if (!wcss->mem_region) {
+-		dev_err(dev, "unable to map memory region: %pa+%pa\n",
+-			&rmem->base, &rmem->size);
+-		return -ENOMEM;
++	struct resource res;
++	int ret;
++
++	ret = of_reserved_mem_region_to_resource(dev->of_node, 0, &res);
++	if (ret) {
++		dev_err(dev, "unable to acquire memory-region resource\n");
++		return ret;
++	}
++
++	wcss->mem_phys = res.start;
++	wcss->mem_reloc = res.start;
++	wcss->mem_size = resource_size(&res);
++	wcss->mem_region = devm_ioremap_resource_wc(dev, &res);
++	if (IS_ERR(wcss->mem_region)) {
++		dev_err(dev, "unable to map memory region: %pR\n", &res);
++		return PTR_ERR(wcss->mem_region);
+ 	}
+ 
+ 	return 0;
+@@ -363,7 +366,7 @@
+ 	qcom_add_glink_subdev(rproc, &wcss->glink_subdev, desc->ss_name);
+ 	qcom_add_ssr_subdev(rproc, &wcss->ssr_subdev, desc->ss_name);
+ 
+-	rproc->auto_boot = false;
++	rproc->auto_boot = desc->auto_boot;
+ 	rproc->dump_conf = RPROC_COREDUMP_INLINE;
+ 	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
+ 
+@@ -378,8 +381,13 @@
+ 	}
+ 
+ 	ret = devm_rproc_add(&pdev->dev, rproc);
+-	if (ret)
+-		return ret;
++	if (ret) {
++		mbox_free_channel(wcss->mbox_chan);
++		qcom_remove_ssr_subdev(rproc, &wcss->ssr_subdev);
++		qcom_remove_glink_subdev(rproc, &wcss->glink_subdev);
++		qcom_q6v5_deinit(&wcss->q6);
++		return ret;
++	}
+ 
+ 	platform_set_drvdata(pdev, rproc);
+ 
