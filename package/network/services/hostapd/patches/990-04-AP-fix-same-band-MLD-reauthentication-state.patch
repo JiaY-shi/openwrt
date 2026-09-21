@@ -1,0 +1,203 @@
+From: JiaY-shi <shi05275@163.com>
+Date: Tue, 18 Aug 2026 03:20:00 +0800
+Subject: [PATCH] AP: fix same-band MLD reauthentication state
+
+An MLD station can start a new authentication exchange on the same band
+without first tearing down its old association. Management frames then
+carry the new link address while the station object is still keyed by its
+MLD address.
+
+Use the per-exchange link address for asynchronous FT and FILS replies and
+as the indication that the current authentication is an MLD exchange. Clear
+it when a legacy authentication starts on a station that still has an MLD
+profile. Do not overwrite the profile of an authorized PMF station until it
+is actually eligible to be replaced.
+
+A previous failed authentication may also leave an independent WPA state
+machine on a partner link. Free those stale state machines before installing
+the new MLD profile, while preserving an authorized PMF association.
+
+This is adapted to the upstream hostapd MLO station model and complements
+the peer-link Authentication reply and TX status fixes already present in
+this tree.
+
+Based on Qualcomm's same-band MLD reconnect, MLD profile overwrite, and
+failed partner authentication fixes.
+
+Co-developed-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
+Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
+Co-developed-by: Sowmiya Sree Elavalagan <ssreeela@qti.qualcomm.com>
+Signed-off-by: Sowmiya Sree Elavalagan <ssreeela@qti.qualcomm.com>
+Co-developed-by: Aditya Kumar Singh <aditya.kumar.singh@oss.qualcomm.com>
+Signed-off-by: Aditya Kumar Singh <aditya.kumar.singh@oss.qualcomm.com>
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+ src/ap/ieee802_11.c     | 39 +++++++++++++++++++++++++++++++--------
+ src/ap/ieee802_11_eht.c |  2 ++
+ src/ap/sta_info.c       | 31 +++++++++++++++++++++++++++
+ src/ap/sta_info.h       |  2 ++
+ 4 files changed, 66 insertions(+), 8 deletions(-)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -372,7 +372,8 @@ static int send_auth_reply(struct hostap
+ #endif /* CONFIG_IEEE8021X_AUTH */
+ 
+ #ifdef CONFIG_IEEE80211BE
+-	if (ap_sta_is_mld(hapd, sta)) {
++	if (ap_sta_is_mld(hapd, sta) &&
++	    !is_zero_ether_addr(sta->auth_link_addr)) {
+ 		ml_resp = hostapd_ml_auth_resp(hapd);
+ 		if (!ml_resp)
+ 			return -1;
+@@ -551,13 +552,22 @@ static void handle_auth_ft_finish(void *
+ {
+ 	struct hostapd_data *hapd = ctx;
+ 	struct sta_info *sta;
++	const u8 *reply_dst = dst;
+ 	int reply_res;
+ 
+-	reply_res = send_auth_reply(hapd, NULL, dst, WLAN_AUTH_FT,
++	sta = ap_get_sta(hapd, dst);
++#ifdef CONFIG_IEEE80211BE
++	if (!sta)
++		sta = ap_get_link_sta(hapd, dst);
++	if (sta && ap_sta_is_mld(hapd, sta) &&
++	    !is_zero_ether_addr(sta->auth_link_addr))
++		reply_dst = sta->auth_link_addr;
++#endif /* CONFIG_IEEE80211BE */
++
++	reply_res = send_auth_reply(hapd, NULL, reply_dst, WLAN_AUTH_FT,
+ 				    auth_transaction, status, ies, ies_len,
+ 				    "auth-ft-finish");
+ 
+-	sta = ap_get_sta(hapd, dst);
+ 	if (sta == NULL)
+ 		return;
+ 
+@@ -960,7 +970,8 @@ static struct wpabuf * auth_build_sae_co
+ 	const u8 *own_addr = hapd->own_addr;
+ 
+ #ifdef CONFIG_IEEE80211BE
+-	if (ap_sta_is_mld(hapd, sta))
++	if (ap_sta_is_mld(hapd, sta) &&
++	    !is_zero_ether_addr(sta->auth_link_addr))
+ 		own_addr = hapd->mld->mld_addr;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+@@ -3365,11 +3376,17 @@ static void handle_auth_fils_finish(stru
+ 				    struct wpabuf *data, int pub)
+ {
+ 	u16 auth_alg;
++	const u8 *dst = sta->addr;
+ 
+ 	auth_alg = (pub ||
+ 		    resp == WLAN_STATUS_FINITE_CYCLIC_GROUP_NOT_SUPPORTED) ?
+ 		WLAN_AUTH_FILS_SK_PFS : WLAN_AUTH_FILS_SK;
+-	send_auth_reply(hapd, sta, sta->addr, auth_alg, 2, resp,
++#ifdef CONFIG_IEEE80211BE
++	if (ap_sta_is_mld(hapd, sta) &&
++	    !is_zero_ether_addr(sta->auth_link_addr))
++		dst = sta->auth_link_addr;
++#endif /* CONFIG_IEEE80211BE */
++	send_auth_reply(hapd, sta, dst, auth_alg, 2, resp,
+ 			data ? wpabuf_head(data) : (u8 *) "",
+ 			data ? wpabuf_len(data) : 0, "auth-fils-finish");
+ 	wpabuf_free(data);
+@@ -4567,8 +4584,12 @@ static void handle_auth(struct hostapd_d
+ 	 * Keep it separate from the association's binding, which is only
+ 	 * established by the (Re)Association Request.
+ 	 */
+-	if (mld_sta && auth_transaction == 1)
+-		os_memcpy(sta->auth_link_addr, mgmt->sa, ETH_ALEN);
++	if (auth_transaction == 1) {
++		if (mld_sta)
++			os_memcpy(sta->auth_link_addr, mgmt->sa, ETH_ALEN);
++		else
++			os_memset(sta->auth_link_addr, 0, ETH_ALEN);
++	}
+ 
+ 	/* Set the non-AP MLD information based on the initial Authentication
+ 	 * frame. Once the STA entry has been added to the driver, the driver
+@@ -4576,7 +4597,8 @@ static void handle_auth(struct hostapd_d
+ 	 * will translate addresses in the frame and we need to avoid overriding
+ 	 * peer_addr based on mgmt->sa which would have been translated to the
+ 	 * MLD MAC address. */
+-	if (!sta->added_unassoc && auth_transaction == 1) {
++	if ((!(sta->flags & WLAN_STA_MFP) || !ap_sta_is_authorized(sta)) &&
++	    !sta->added_unassoc && auth_transaction == 1) {
+ 		ap_sta_free_sta_profile(&sta->mld_info);
+ 		os_memset(&sta->mld_info, 0, sizeof(sta->mld_info));
+ 
+@@ -4585,6 +4607,7 @@ static void handle_auth(struct hostapd_d
+ 
+ 			ap_sta_set_mld(sta, true);
+ 			sta->mld_assoc_link_id = link_id;
++			ap_sta_clear_failed_mld_auth(hapd, sta);
+ 
+ 			/*
+ 			 * Set the MLD address as the station address and the
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -1007,6 +1007,8 @@ sae_confirm_skip_fixed_fields(struct hos
+ 	 * on the MLD MAC address.
+ 	 */
+ 	sta = ap_get_sta(hapd, mgmt->sa);
++	if (!sta)
++		sta = ap_get_link_sta(hapd, mgmt->sa);
+ 	if (!sta) {
+ 		wpa_printf(MSG_DEBUG, "SAE: No MLD STA for SAE confirm");
+ 		for (sta = hapd->sta_list; sta; sta = sta->next) {
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -314,6 +314,37 @@ void clear_wpa_sm_for_all_sta(struct hos
+ 	}
+ }
+ 
++
++void ap_sta_clear_failed_mld_auth(struct hostapd_data *hapd,
++				  struct sta_info *psta)
++{
++	struct hostapd_data *lhapd;
++
++	if (!ap_sta_is_mld(hapd, psta))
++		return;
++
++	for_each_mld_link(lhapd, hapd) {
++		struct sta_info *lsta;
++		struct wpa_state_machine *sm;
++
++		if (lhapd == hapd)
++			continue;
++
++		lsta = ap_get_sta(lhapd, psta->addr);
++		if (!lsta || lsta == psta ||
++		    ((lsta->flags & WLAN_STA_MFP) &&
++		     ap_sta_is_authorized(lsta)))
++			continue;
++
++		sm = lsta->wpa_sm;
++		if (!sm || sm == psta->wpa_sm)
++			continue;
++
++		clear_wpa_sm_for_all_sta(lhapd, sm);
++		wpa_auth_sta_deinit(sm);
++	}
++}
++
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -467,6 +467,8 @@ void clear_wpa_sm_for_each_partner_link(
+ 					struct sta_info *psta);
+ void clear_wpa_sm_for_all_sta(struct hostapd_data *hapd,
+ 			      struct wpa_state_machine *wpa_sm);
++void ap_sta_clear_failed_mld_auth(struct hostapd_data *hapd,
++				  struct sta_info *psta);
+ int skip_prune_for_partner_links(struct hostapd_data *hapd,
+ 				 struct sta_info *sta);
+ 
+-- 
+2.51.0

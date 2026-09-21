@@ -1,0 +1,86 @@
+From: JiaY-shi <shi05275@163.com>
+Date: Sun, 16 Aug 2026 23:45:00 +0800
+Subject: [PATCH] AP: clean up stale MLD links after SA Query timeout
+
+An authorized MLD station can reconnect without first sending a
+deauthentication frame.  PMF requires hostapd to keep the old station and
+keys alive while the SA Query is pending.  Once the query times out, however,
+the association path currently keeps the authorized partner STA objects.
+Creating the partner links for the new association then fails with "MLD:
+link: Station already exists" and the station falls back to a single link.
+
+Perform the destructive cleanup only after the SA Query timeout has been
+confirmed.  Drop every reference to the shared WPA state machine before
+freeing partner STA objects, and use ap_sta_re_add() to remove all partner
+links and put the association-link STA back into the driver as an
+unassociated peer.  This ordering makes the main peer available before the
+new partner peers are installed.
+
+Restore the userspace authentication flag cleared by ap_sta_re_add(), and
+reset the propagated SA Query timeout immediately so a later association
+attempt cannot repeat the cleanup and remove the freshly added main peer.
+The MLD-AP check also covers an old MLD station reconnecting as a legacy
+station, whose freshly parsed authentication state no longer has mld_sta set.
+
+Based on Qualcomm's MLD STA reconnection and SA Query timeout fixes.
+
+Patch-dependency: 991-AP-fix-legacy-station-roaming-between-MLD-links.patch
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+ src/ap/ieee802_11.c | 42 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -7475,6 +7475,48 @@ static void handle_assoc(struct hostapd_
+ 		goto fail;
+ 	}
+ 
++#ifdef CONFIG_IEEE80211BE
++	/*
++	 * Authentication must not tear down an existing PMF association while
++	 * its SA Query is pending. Once the query has timed out, remove all old
++	 * MLD link objects before parsing and installing the new association.
++	 */
++	if ((sta->flags & WLAN_STA_MFP) && sta->sa_query_timed_out &&
++	    hapd->conf->mld_ap) {
++		struct wpa_state_machine *sm = sta->wpa_sm;
++		bool authenticated = !!(sta->flags & WLAN_STA_AUTH);
++
++		wpa_printf(MSG_DEBUG,
++			   "MLD: Re-add STA " MACSTR
++			   " after timed out SA Query procedure",
++			   MAC2STR(sta->addr));
++
++		/* All link STA objects share this state machine. Clear every
++		 * reference before ap_sta_re_add() frees the old partners. */
++		if (sm) {
++			clear_wpa_sm_for_each_partner_link(hapd, sta);
++			clear_wpa_sm_for_all_sta(hapd, sm);
++			wpa_auth_sta_deinit(sm);
++			sta->wpa_sm = NULL;
++		}
++
++		/* check_authorized=0 is intentional: SA Query has proved that
++		 * the old authorized association can now be replaced. Re-adding
++		 * the main peer before processing the MLE lets the driver accept
++		 * the new partner peers. */
++		if (ap_sta_re_add(hapd, sta, 0) < 0) {
++			wpa_printf(MSG_INFO,
++				   "MLD: Failed to re-add STA after SA Query timeout");
++			resp = WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
++			goto fail;
++		}
++
++		if (authenticated)
++			sta->flags |= WLAN_STA_AUTH;
++		ap_sta_set_sa_query_timeout(hapd, sta, 0);
++	}
++#endif /* CONFIG_IEEE80211BE */
++
+ 	/*
+ 	 * sta->capability is used in check_assoc_ies() for RRM enabled
+ 	 * capability element.
+-- 
+2.51.0
