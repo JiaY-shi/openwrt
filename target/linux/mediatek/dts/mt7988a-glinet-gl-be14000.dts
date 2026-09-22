@@ -118,6 +118,8 @@
 		los-gpios = <&pio 81 GPIO_ACTIVE_HIGH>;
 		tx-fault-gpios = <&pio 37 GPIO_ACTIVE_HIGH>;
 		tx-disable-gpios = <&pio 36 GPIO_ACTIVE_HIGH>;
+		rate-select0-gpios = <&pio 83 GPIO_ACTIVE_HIGH>;
+		rate-select1-gpios = <&pio 80 GPIO_ACTIVE_HIGH>;
 		maximum-power-milliwatt = <3000>;
 	};
 };
