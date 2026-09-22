@@ -1,0 +1,42 @@
+From: Nilanka de Silva <nilankadsilva@gmail.com>
+Subject: net: ethernet: mtk_eth_soc: name GMAC netdevs from "openwrt,netdev-name" at registration
+
+OpenWrt applies the DT property "openwrt,netdev-name" from userspace in
+/lib/preinit/04_set_netdev_label, a one-shot pass over /sys/class/net at
+preinit time. On the GL-BE14000 the whole mtk_eth_soc probe completes only
+after the RTL8261C PHY has initialised (~0.6 s after preinit starts), so the
+10G GMAC frequently registers after that pass and stays "eth2", dropping out
+of the configured bridge. Give the netdev its DT name before register_netdev,
+the way DSA honours "label" for switch ports, so no userspace rename is needed.
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -5252,6 +5252,20 @@ static int mtk_fill_available_pcs(struct
+ 	return 0;
+ }
+ 
++/* OpenWrt: take the netdev name from the DT so it does not depend on a
++ * userspace rename pass that can run before this driver has probed.
++ */
++static void mtk_netdev_name_from_dt(struct net_device *dev,
++				    struct device_node *np)
++{
++	const char *name;
++
++	if (of_property_read_string(np, "openwrt,netdev-name", &name))
++		return;
++	if (!strchr(name, '%') && strlen(name) < IFNAMSIZ)
++		strscpy(dev->name, name, IFNAMSIZ);
++}
++
+ static int mtk_add_mac(struct mtk_eth *eth, struct device_node *np)
+ {
+ 	const __be32 *_id = of_get_property(np, "reg", NULL);
+@@ -5442,6 +5456,7 @@ no_pcs:
+ 			  mac->phylink_config.supported_interfaces);
+ 
+ 	SET_NETDEV_DEV(eth->netdev[id], eth->dev);
++	mtk_netdev_name_from_dt(eth->netdev[id], np);
+ 	eth->netdev[id]->watchdog_timeo = 5 * HZ;
+ 	eth->netdev[id]->netdev_ops = &mtk_netdev_ops;
+ 	eth->netdev[id]->base_addr = (unsigned long)eth->base;
