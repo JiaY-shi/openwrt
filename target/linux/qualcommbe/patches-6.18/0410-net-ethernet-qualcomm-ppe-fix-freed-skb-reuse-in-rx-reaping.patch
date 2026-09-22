@@ -1,5 +1,5 @@
 From: Kenneth Kasilag <kenneth@kasilag.me>
-Subject: [PATCH] net: ethernet: qualcomm: ppe: fix Rx skb ownership bugs
+Subject: [PATCH] net: ethernet: qualcomm: ppe: harden Rx buffer lifecycle
 
 The Rx reaping loop keeps the skb belonging to the next descriptor in
 next_skb, but only the paths that deliver the current frame reload it.
@@ -25,8 +25,48 @@ segment processing operate only on the live head skb.  Finally, leave a
 linear skb rejected by pskb_may_pull() owned by the reap loop; freeing it
 in both the helper and its caller otherwise double-frees it.
 
+Release an incomplete scatter frame retained by a descriptor ring during
+teardown as well.
+
+Finally, edma_cfg_rx_napi_delete() already disables each registered NAPI
+instance.  Do not disable the same instances immediately before calling
+it, as napi_disable() calls must pair with napi_enable() calls.
+
 Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
+Co-developed-by: JiaY-shi <shi05275@163.com>
+Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.c
+@@ -743,6 +743,5 @@ static int edma_hw_configure(void)
+ edma_cfg_rx_rps_hash_map_failed:
+ configure_ucast_prio_map_tbl_failed:
+-	edma_cfg_rx_napi_disable();
+ 	edma_cfg_rx_napi_delete();
+ 	edma_cfg_rx_rings_disable();
+ edma_cfg_rx_rings_failed:
+@@ -799,7 +798,6 @@ void edma_destroy(struct ppe_device *ppe
+ 	kfree(edma_ctx->intr_info.intr_rx);
+ 	kfree(edma_ctx->intr_info.intr_txcmpl);
+ 
+-	edma_cfg_rx_napi_disable();
+ 	edma_cfg_rx_napi_delete();
+ 	edma_cfg_rx_rings_disable();
+ 	edma_cfg_rx_rings_cleanup();
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
+@@ -543,6 +543,11 @@ static void edma_cfg_rx_desc_ring_cleanu
+ 		dev_kfree_skb_any(skb);
+ 	}
+ 
++	dev_kfree_skb_any(rxdesc_ring->head);
++	rxdesc_ring->head = NULL;
++	rxdesc_ring->last = NULL;
++	rxdesc_ring->pdesc_head = NULL;
++
+ 	/* Update the consumer index */
+ 	reg = EDMA_BASE_OFFSET + EDMA_REG_RXDESC_CONS_IDX(rxdesc_ring->ring_id);
+ 	regmap_write(regmap, reg, cons_idx);
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
 @@ -150,8 +150,7 @@ static inline uint8_t edma_rx_checksum_v
@@ -108,4 +148,4 @@ Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
 -
  		/* Handle scatter frame processing for first/middle/last segments. */
  		page_mode ? edma_rx_handle_nr_frags(rxdesc_ring, rxdesc_pri, skb) :
- 			edma_rx_handle_frag_list(rxdesc_ring, rxdesc_pri, skb);
+			edma_rx_handle_frag_list(rxdesc_ring, rxdesc_pri, skb);

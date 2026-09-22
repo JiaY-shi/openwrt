@@ -1,0 +1,255 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: validate RX descriptors
+
+The EDMA receive path trusts the packet length and scatter continuation
+bits supplied in completion descriptors.  It passes an unchecked length
+to skb_put() or skb_add_rx_frag(), and page mode appends fragments
+without enforcing MAX_SKB_FRAGS.  A malformed descriptor can therefore
+write beyond skb storage or the fragment array and corrupt unrelated
+kernel memory.
+
+Validate each segment against the DMA buffer before touching the skb.
+Abort an in-progress scatter frame on malformed input and discard its
+remaining descriptors through the final segment, so a continuation
+cannot be mistaken for a new packet.  Reject missing opaque skb
+references and overlong page-fragment chains, with counters for all
+three cases.
+
+Build the first page-mode scatter fragment through skb_add_rx_frag() as
+well.  This records the actual segment length and preserves correct skb
+truesize accounting instead of leaving the allocation-time PAGE_SIZE
+fragment length in place.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
+@@ -167,6 +167,16 @@
+ 	rxdesc_ring->last = NULL;
+ 	rxdesc_ring->pdesc_head = NULL;
+ 	rxdesc_ring->vp_punt_src = -1;
++	rxdesc_ring->scatter_drop = false;
++}
++
++static void edma_rx_scatter_abort(struct edma_rxdesc_ring *rxdesc_ring,
++				  struct sk_buff *skb, bool more)
++{
++	dev_kfree_skb_any(rxdesc_ring->head);
++	dev_kfree_skb_any(skb);
++	edma_rx_scatter_reset(rxdesc_ring);
++	rxdesc_ring->scatter_drop = more;
+ }
+ 
+ /* Hand a source-virtual-port frame to its destination. A frame whose
+@@ -206,7 +216,9 @@
+ 
+ 	edma_rx_scatter_reset(rxdesc_ring);
+ 
+-	if (unlikely(page_mode && !pskb_may_pull(skb_head, ETH_HLEN))) {
++	if (unlikely(page_mode &&
++		     !pskb_may_pull(skb_head,
++				    EDMA_RXDESC_DATA_OFFSET_GET(pdesc_head) + ETH_HLEN))) {
+ 		ppe_vp_miss_disable(edma_ctx->ppe_dev, vp);
+ 		dev_kfree_skb_any(skb_head);
+ 		return;
+@@ -258,7 +270,9 @@
+ 	rx_stats = this_cpu_ptr(pcpu_stats->rx_stats);
+ 
+ 	if (unlikely(page_mode)) {
+-		if (unlikely(!pskb_may_pull(skb_head, ETH_HLEN))) {
++		if (unlikely(!pskb_may_pull(skb_head,
++					    EDMA_RXDESC_DATA_OFFSET_GET(rxdesc_ring->pdesc_head) +
++					    ETH_HLEN))) {
+ 			/* Discard the SKB that we have been building,
+ 			 * in addition to the SKB linked to current descriptor.
+ 			 */
+@@ -361,7 +375,8 @@
+ 				    struct edma_rxdesc_pri *rxdesc_pri,
+ 				    struct sk_buff *skb)
+ {
+-	skb_frag_t *frag = NULL;
++	struct edma_rxdesc_stats *stats = &rxdesc_ring->rxdesc_stats;
++	skb_frag_t *frag = &skb_shinfo(skb)->frags[0];
+ 	u32 pkt_length;
+ 
+ 	pkt_length = EDMA_RXDESC_PACKET_LEN_GET(rxdesc_pri);
+@@ -369,9 +384,8 @@
+ 		 edma_ctx, skb, pkt_length);
+ 
+ 	if (!(rxdesc_ring->head)) {
+-		skb->len = pkt_length;
+-		skb->data_len = pkt_length;
+-		skb->truesize = SKB_TRUESIZE(PAGE_SIZE);
++		skb_add_rx_frag(skb, 0, skb_frag_page(frag), 0, pkt_length,
++				PAGE_SIZE);
+ 		rxdesc_ring->head = skb;
+ 		rxdesc_ring->last = NULL;
+ 		rxdesc_ring->pdesc_head = rxdesc_pri;
+@@ -379,7 +393,19 @@
+ 		return;
+ 	}
+ 
+-	frag = &skb_shinfo(skb)->frags[0];
++	if (unlikely(skb_shinfo(rxdesc_ring->head)->nr_frags >= MAX_SKB_FRAGS)) {
++		if (net_ratelimit())
++			pr_warn("Rx scatter frame exceeds %u fragments on ring %u\n",
++				MAX_SKB_FRAGS, rxdesc_ring->ring_id);
++
++		u64_stats_update_begin(&stats->syncp);
++		++stats->scatter_frag_overflow;
++		u64_stats_update_end(&stats->syncp);
++
++		edma_rx_scatter_abort(rxdesc_ring, skb,
++				      EDMA_RXDESC_MORE_BIT_GET(rxdesc_pri));
++		return;
++	}
+ 
+ 	/* Append current frag at correct index as nr_frag of parent. */
+ 	skb_add_rx_frag(rxdesc_ring->head, skb_shinfo(rxdesc_ring->head)->nr_frags,
+@@ -673,6 +699,10 @@
+ 		struct sk_buff *skb;
+ 		dma_addr_t dma_addr;
+ 		u32 dma_map_size;
++		u32 pkt_length;
++		u32 data_offset;
++		u32 buffer_len;
++		bool more, skip = false;
+ 
+ 		skb = next_skb;
+ 		rxdesc_pri = next_rxdesc_pri;
+@@ -684,7 +714,52 @@
+ 		else
+ 			dma_unmap_page(dev, dma_addr, PAGE_SIZE, DMA_FROM_DEVICE);
+ 
++		more = EDMA_RXDESC_MORE_BIT_GET(rxdesc_pri);
++		if (unlikely(!skb)) {
++			if (net_ratelimit())
++				pr_warn("Missing Rx skb on ring %u at index %u\n",
++					rxdesc_ring->ring_id, cons_idx);
++
++			u64_stats_update_begin(&rxdesc_stats->syncp);
++			++rxdesc_stats->invalid_buffer;
++			u64_stats_update_end(&rxdesc_stats->syncp);
++
++			edma_rx_scatter_abort(rxdesc_ring, NULL, more);
++			skip = true;
++			goto advance_rx_desc;
++		}
++
++		if (unlikely(rxdesc_ring->scatter_drop)) {
++			dev_kfree_skb_any(skb);
++			if (!more)
++				rxdesc_ring->scatter_drop = false;
++			skip = true;
++			goto advance_rx_desc;
++		}
++
++		pkt_length = EDMA_RXDESC_PACKET_LEN_GET(rxdesc_pri);
++		data_offset = EDMA_RXDESC_DATA_OFFSET_GET(rxdesc_pri);
++		buffer_len = page_mode ? PAGE_SIZE : dma_map_size;
++		if (unlikely(!pkt_length || pkt_length > buffer_len ||
++			     (!rxdesc_ring->head &&
++			      (data_offset > pkt_length ||
++			       pkt_length - data_offset < ETH_HLEN)))) {
++			if (net_ratelimit())
++				pr_warn("Invalid Rx length %u offset %u buffer %u on ring %u\n",
++					pkt_length, data_offset, buffer_len,
++					rxdesc_ring->ring_id);
++
++			u64_stats_update_begin(&rxdesc_stats->syncp);
++			++rxdesc_stats->invalid_data_len;
++			u64_stats_update_end(&rxdesc_stats->syncp);
++
++			edma_rx_scatter_abort(rxdesc_ring, skb, more);
++			skip = true;
++			goto advance_rx_desc;
++		}
++
+ 		/* Update consumer index. */
++advance_rx_desc:
+ 		cons_idx = (cons_idx + 1) & EDMA_RX_RING_SIZE_MASK;
+ 
+ 		/* Get the next Rx descriptor and its skb. The skb must advance
+@@ -694,6 +769,8 @@
+ 		 */
+ 		next_rxdesc_pri = EDMA_RXDESC_PRI_DESC(rxdesc_ring, cons_idx);
+ 		next_skb = (struct sk_buff *)EDMA_RXDESC_OPAQUE_GET(next_rxdesc_pri);
++		if (unlikely(skip))
++			goto next_rx_desc;
+ 
+ 		/* Handle linear packets or initial segments first. */
+ 		if (likely(!(rxdesc_ring->head))) {
+@@ -735,7 +812,8 @@
+ 				ndev = edma_rx_get_src_dev(rxdesc_stats,
+ 							   src_info, skb);
+ 				if (unlikely(!ndev)) {
+-					dev_kfree_skb_any(skb);
++					edma_rx_scatter_abort(rxdesc_ring, skb,
++							      more);
+ 					goto next_rx_desc;
+ 				}
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
+@@ -144,12 +144,18 @@
+  * @src_port_inval: Invalid source port number
+  * @src_port_inval_type: Source type is not PORT ID
+  * @src_port_inval_netdev: Invalid net device for the source port
++ * @invalid_buffer: Descriptor without an skb reference
++ * @invalid_data_len: Descriptor lengths outside the mapped buffer
++ * @scatter_frag_overflow: Scatter frames exceeding MAX_SKB_FRAGS
+  * @syncp: Synchronization pointer
+  */
+ struct edma_rxdesc_stats {
+ 	u64 src_port_inval;
+ 	u64 src_port_inval_type;
+ 	u64 src_port_inval_netdev;
++	u64 invalid_buffer;
++	u64 invalid_data_len;
++	u64 scatter_frag_overflow;
+ 	struct u64_stats_sync syncp;
+ };
+ 
+@@ -264,6 +270,7 @@
+  * @sdma: Secondary descriptor ring physical address
+  * @head: Head of the skb list in case of scatter-gather frame
+  * @last: Last skb of the skb list in case of scatter-gather frame
++ * @scatter_drop: Drop descriptors until the current scatter frame ends
+  */
+ struct edma_rxdesc_ring {
+ 	struct napi_struct napi;
+@@ -282,6 +289,7 @@
+ 	struct sk_buff *head;
+ 	struct sk_buff *last;
+ 	int vp_punt_src;	/* source VP of an in-progress punt reassembly, or -1 */
++	bool scatter_drop;
+ };
+ 
+ extern int edma_rx_napi_budget;
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_debugfs.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_debugfs.c
+@@ -89,6 +89,9 @@
+ 			rxdesc_stats[i].src_port_inval = stats->src_port_inval;
+ 			rxdesc_stats[i].src_port_inval_type = stats->src_port_inval_type;
+ 			rxdesc_stats[i].src_port_inval_netdev = stats->src_port_inval_netdev;
++			rxdesc_stats[i].invalid_buffer = stats->invalid_buffer;
++			rxdesc_stats[i].invalid_data_len = stats->invalid_data_len;
++			rxdesc_stats[i].scatter_frag_overflow = stats->scatter_frag_overflow;
+ 		} while (u64_stats_fetch_retry(&stats->syncp, start));
+ 	}
+ 
+@@ -104,6 +107,13 @@
+ 		seq_printf(m, "\t\t rxdesc[%d]:src_port_inval_netdev = %llu\n",
+ 			   i + rx->ring_start,
+ 			   rxdesc_stats[i].src_port_inval_netdev);
++		seq_printf(m, "\t\t rxdesc[%d]:invalid_buffer = %llu\n",
++			   i + rx->ring_start, rxdesc_stats[i].invalid_buffer);
++		seq_printf(m, "\t\t rxdesc[%d]:invalid_data_len = %llu\n",
++			   i + rx->ring_start, rxdesc_stats[i].invalid_data_len);
++		seq_printf(m, "\t\t rxdesc[%d]:scatter_frag_overflow = %llu\n",
++			   i + rx->ring_start,
++			   rxdesc_stats[i].scatter_frag_overflow);
+ 		seq_puts(m, "\n");
+ 	}
+ 
+

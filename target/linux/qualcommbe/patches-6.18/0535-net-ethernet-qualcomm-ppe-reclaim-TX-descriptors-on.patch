@@ -1,0 +1,386 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: reclaim TX descriptors on
+ completion
+
+The hardware TX descriptor consumer advances when EDMA has fetched a
+descriptor, before software has reaped its completion.  Using that index
+as the descriptor availability boundary allows a busy ring to wrap and
+reuse software DMA state that is still owned by an outstanding completion.
+The old completion can then unmap and free the new packet, followed by a
+stream of invalid completions.
+
+Reserve descriptors from a software counter and return them only after
+their completions have unmapped the DMA buffers.  Publish the free slot
+after all of its software state is cleared, and refuse to overwrite a busy
+slot even if the accounting invariant is violated.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
+@@ -110,7 +110,7 @@ void edma_tx_xmit_segs(struct net_device
+ 	}
+ }
+ 
+-static void edma_tx_buffer_unmap(struct edma_tx_buffer *buf)
++static void edma_tx_buffer_unmap(struct edma_tx_buffer *buf)
+ {
+ 	struct device *dev = edma_ctx->ppe_dev->dev;
+ 
+@@ -124,23 +124,27 @@ static void edma_tx_buffer_unmap(struct
+ 
+ 	buf->dma = 0;
+ 	buf->len = 0;
+-	buf->mapped = false;
+ 	buf->page = false;
++	WRITE_ONCE(buf->mapped, false);
+ }
+ 
+-static void edma_tx_buffer_set(struct edma_txdesc_ring *txdesc_ring,
+-			       struct edma_txdesc_pri *txdesc,
+-			       dma_addr_t dma, u32 len, bool page)
++static bool edma_tx_buffer_set(struct edma_txdesc_ring *txdesc_ring,
++			       struct edma_txdesc_pri *txdesc,
++			       dma_addr_t dma, u32 len, bool page)
+ {
+ 	u32 index = txdesc - txdesc_ring->pdesc;
+ 	struct edma_tx_buffer *buf = &txdesc_ring->buf[index];
+ 
+-	WARN_ON_ONCE(buf->mapped || buf->skb);
++	if (WARN_ON_ONCE(READ_ONCE(buf->mapped) || buf->skb))
++		return false;
++
+ 	buf->dma = dma;
+ 	buf->len = len;
+-	buf->mapped = true;
+ 	buf->page = page;
++	WRITE_ONCE(buf->mapped, true);
+ 	EDMA_TXDESC_OPAQUE_SET(txdesc, buf);
++
++	return true;
+ }
+ 
+ static void edma_tx_unmap_range(struct edma_txdesc_ring *txdesc_ring,
+@@ -149,8 +153,8 @@ static void edma_tx_unmap_range(struct e
+ 	while (start != end) {
+ 		struct edma_tx_buffer *buf = &txdesc_ring->buf[start];
+ 
+-		edma_tx_buffer_unmap(buf);
+ 		buf->skb = NULL;
++		edma_tx_buffer_unmap(buf);
+ 		start = (start + 1) & EDMA_TX_RING_SIZE_MASK;
+ 	}
+ }
+@@ -165,9 +169,11 @@ void edma_tx_ring_buffers_cleanup(struct
+ 	for (i = 0; i < txdesc_ring->count; i++) {
+ 		struct edma_tx_buffer *buf = &txdesc_ring->buf[i];
+ 
+-		edma_tx_buffer_unmap(buf);
+-		dev_kfree_skb_any(buf->skb);
++		struct sk_buff *skb = buf->skb;
++
+ 		buf->skb = NULL;
++		edma_tx_buffer_unmap(buf);
++		dev_kfree_skb_any(skb);
+ 	}
+ }
+ 
+@@ -240,8 +246,8 @@ u32 edma_tx_complete(u32 work_to_do, str
+ 				++txcmpl_stats->errors;
+ 			u64_stats_update_end(&txcmpl_stats->syncp);
+ 		}
+ 
+-		if (unlikely(!buf || !buf->mapped)) {
++		if (unlikely(!buf || !READ_ONCE(buf->mapped))) {
+ 			if (net_ratelimit())
+ 				dev_warn(dev, "Invalid cons_idx:%u prod_idx:%u word2:%x word3:%x\n",
+ 					 cons_idx, prod_idx, txcmpl->word2, txcmpl->word3);
+@@ -252,8 +258,10 @@ u32 edma_tx_complete(u32 work_to_do, str
+ 		}
+ 
+ 		skb = buf->skb;
+-		edma_tx_buffer_unmap(buf);
+ 		buf->skb = NULL;
++		edma_tx_buffer_unmap(buf);
++		/* The atomic update publishes the fully cleared buffer state. */
++		atomic_inc(&buf->ring->avail_desc);
+ 
+ 		if (more) {
+ 			u64_stats_update_begin(&txcmpl_stats->syncp);
+@@ -405,7 +413,11 @@ static int edma_tx_skb_nr_frags(struct e
+ 		EDMA_TXDESC_BUFFER_ADDR_SET(txd, buff_addr);
+ 		EDMA_TXDESC_DATA_LEN_SET(txd, buf_len);
+ 		EDMA_TXDESC_POOL_ID_SET(txd, (i + 1));
+-		edma_tx_buffer_set(txdesc_ring, txd, buff_addr, buf_len, true);
++		if (unlikely(!edma_tx_buffer_set(txdesc_ring, txd, buff_addr,
++						 buf_len, true))) {
++			dma_unmap_page(dev, buff_addr, buf_len, DMA_TO_DEVICE);
++			return -EBUSY;
++		}
+ 
+ 		*hw_next_to_use = ((*hw_next_to_use + 1) & EDMA_TX_RING_SIZE_MASK);
+ 		(*num_descs)++;
+@@ -531,7 +543,11 @@ static struct edma_txdesc_pri *edma_tx_s
+ 
+ 	/* Set packet length in the descriptor. */
+ 	EDMA_TXDESC_DATA_LEN_SET(txd, buf_len);
+-	edma_tx_buffer_set(txdesc_ring, txd, buff_addr, buf_len, false);
++	if (unlikely(!edma_tx_buffer_set(txdesc_ring, txd, buff_addr,
++					 buf_len, false))) {
++		dma_unmap_single(dev, buff_addr, buf_len, DMA_TO_DEVICE);
++		return NULL;
++	}
+ 	*hw_next_to_use = (*hw_next_to_use + 1) & EDMA_TX_RING_SIZE_MASK;
+ 
+ 	return txd;
+@@ -597,8 +613,12 @@ static int edma_tx_skb_sg_fill_desc(stru
+ 			EDMA_TXDESC_BUFFER_ADDR_SET(txd, buff_addr);
+ 			EDMA_TXDESC_DATA_LEN_SET(txd, buf_len);
+ 			EDMA_TXDESC_POOL_ID_SET(txd, 0);
+-			edma_tx_buffer_set(txdesc_ring, txd, buff_addr,
+-					   buf_len, false);
++			if (unlikely(!edma_tx_buffer_set(txdesc_ring, txd,
++							 buff_addr, buf_len,
++							 false))) {
++				dma_unmap_single(dev, buff_addr, buf_len, DMA_TO_DEVICE);
++				goto dma_err;
++			}
+ 
+ 			*hw_next_to_use = (*hw_next_to_use + 1) & EDMA_TX_RING_SIZE_MASK;
+ 			(*num_descs)++;
+@@ -652,22 +672,18 @@ dma_err:
+ 	return -ENOMEM;
+ }
+ 
+-static u32 edma_tx_avail_desc(struct edma_txdesc_ring *txdesc_ring,
+-			      u32 hw_next_to_use)
++static bool edma_tx_reserve_descs(struct edma_txdesc_ring *txdesc_ring,
++				  u32 count)
+ {
+-	struct ppe_device *ppe_dev = edma_ctx->ppe_dev;
+-	u32 data = 0, avail = 0, hw_next_to_clean = 0;
+-	struct regmap *regmap = ppe_dev->regmap;
+-	u32 reg;
+-
+-	reg = EDMA_BASE_OFFSET + EDMA_REG_TXDESC_CONS_IDX(txdesc_ring->id);
+-	regmap_read(regmap, reg, &data);
+-	hw_next_to_clean = data & EDMA_TXDESC_CONS_IDX_MASK;
++	int avail = atomic_read(&txdesc_ring->avail_desc);
+ 
+-	avail = EDMA_DESC_AVAIL_COUNT(hw_next_to_clean - 1,
+-				      hw_next_to_use, EDMA_TX_RING_SIZE);
++	do {
++		if (avail < count)
++			return false;
++	} while (!atomic_try_cmpxchg(&txdesc_ring->avail_desc, &avail,
++					    avail - count));
+ 
+-	return avail;
++	return true;
+ }
+ 
+ /**
+@@ -688,10 +704,10 @@ enum edma_tx_status edma_tx_ring_xmit(st
+ {
+ 	struct edma_txdesc_stats *txdesc_stats = &txdesc_ring->txdesc_stats;
+ 	struct edma_port_priv *port_priv = netdev_priv(netdev);
+-	u32 num_tx_desc_needed = 0, num_desc_filled = 0;
++	u32 num_tx_desc_needed, num_desc_filled = 0;
+ 	struct ppe_device *ppe_dev = edma_ctx->ppe_dev;
+ 	struct ppe_port *port = port_priv->ppe_port;
+ 	struct regmap *regmap = ppe_dev->regmap;
+ 	struct edma_txdesc_pri *txdesc = NULL;
+ 	int port_id = port->port_id;
+ 	u32 hw_next_to_use = 0;
+@@ -701,24 +717,42 @@ enum edma_tx_status edma_tx_ring_xmit(st
+ 	hw_next_to_use = txdesc_ring->prod_idx;
+ 	start_idx = hw_next_to_use;
+ 
+-	if (unlikely(!(txdesc_ring->avail_desc)))  {
+-		txdesc_ring->avail_desc = edma_tx_avail_desc(txdesc_ring,
+-							     hw_next_to_use);
+-		if (unlikely(!txdesc_ring->avail_desc)) {
+-			netdev_dbg(netdev, "No available descriptors are present at %d ring\n",
+-				   txdesc_ring->id);
+-
+-			u64_stats_update_begin(&txdesc_stats->syncp);
+-			++txdesc_stats->no_desc_avail;
+-			u64_stats_update_end(&txdesc_stats->syncp);
+-			return EDMA_TX_FAIL_NO_DESC;
+-		}
+-	}
+-
+ 	/* Process head skb for linear skb.
+ 	 * Process head skb + nr_frags + fraglist for non linear skb.
+ 	 */
+-	if (likely(!skb_is_nonlinear(skb))) {
++	if (likely(!skb_is_nonlinear(skb)))
++		num_tx_desc_needed = 1;
++	else {
++		num_tx_desc_needed = edma_tx_num_descs_for_sg(skb);
++
++		/* HW does not support TSO for packets with more than 32 segments. */
++		if (unlikely(num_tx_desc_needed > EDMA_TX_TSO_SEG_MAX)) {
++			netdev_dbg(netdev, "Number of segments %u more than %u for %d ring\n",
++				   num_tx_desc_needed, EDMA_TX_TSO_SEG_MAX,
++				   txdesc_ring->id);
++			u64_stats_update_begin(&txdesc_stats->syncp);
++			++txdesc_stats->tso_max_seg_exceed;
++			u64_stats_update_end(&txdesc_stats->syncp);
++			u64_stats_update_begin(&stats->syncp);
++			stats->tx_tso_drop_pkts++;
++			u64_stats_update_end(&stats->syncp);
++			return EDMA_TX_FAIL;
++		}
++	}
++
++	if (unlikely(!edma_tx_reserve_descs(txdesc_ring,
++					   num_tx_desc_needed))) {
++		netdev_dbg(netdev,
++			   "Not enough available descriptors at ring %d: needed %u, available %d\n",
++			   txdesc_ring->id, num_tx_desc_needed,
++			   atomic_read(&txdesc_ring->avail_desc));
++		u64_stats_update_begin(&txdesc_stats->syncp);
++		++txdesc_stats->no_desc_avail;
++		u64_stats_update_end(&txdesc_stats->syncp);
++		return EDMA_TX_FAIL_NO_DESC;
++	}
++
++	if (likely(!skb_is_nonlinear(skb))) {
+ 		txdesc = edma_tx_skb_first_desc(port_priv, txdesc_ring, skb,
+ 						&hw_next_to_use, stats, src_vp);
+ 		if (unlikely(!txdesc)) {
+@@ -727,6 +761,7 @@ enum edma_tx_status edma_tx_ring_xmit(st
+ 			u64_stats_update_begin(&txdesc_stats->syncp);
+ 			++txdesc_stats->no_desc_avail;
+ 			u64_stats_update_end(&txdesc_stats->syncp);
++			atomic_add(num_tx_desc_needed, &txdesc_ring->avail_desc);
+ 			return EDMA_TX_FAIL_NO_DESC;
+ 		}
+ 
+@@ -733,40 +768,6 @@ enum edma_tx_status edma_tx_ring_xmit(st
+ 		EDMA_TXDESC_ENDIAN_SET(txdesc);
+ 		num_desc_filled++;
+ 	} else {
+-		num_tx_desc_needed = edma_tx_num_descs_for_sg(skb);
+-
+-		/* HW does not support TSO for packets with more than 32 segments.
+-		 * HW hangs up if it sees more than 32 segments. Kernel Perform GSO
+-		 * for such packets with netdev gso_max_segs set to 32.
+-		 */
+-		if (unlikely(num_tx_desc_needed > EDMA_TX_TSO_SEG_MAX)) {
+-			netdev_dbg(netdev, "Number of segments %u more than %u for %d ring\n",
+-				   num_tx_desc_needed, EDMA_TX_TSO_SEG_MAX, txdesc_ring->id);
+-			u64_stats_update_begin(&txdesc_stats->syncp);
+-			++txdesc_stats->tso_max_seg_exceed;
+-			u64_stats_update_end(&txdesc_stats->syncp);
+-
+-			u64_stats_update_begin(&stats->syncp);
+-			stats->tx_tso_drop_pkts++;
+-			u64_stats_update_end(&stats->syncp);
+-
+-			return EDMA_TX_FAIL;
+-		}
+-
+-		if (unlikely(num_tx_desc_needed > txdesc_ring->avail_desc)) {
+-			txdesc_ring->avail_desc = edma_tx_avail_desc(txdesc_ring,
+-								     hw_next_to_use);
+-			if (num_tx_desc_needed > txdesc_ring->avail_desc) {
+-				u64_stats_update_begin(&txdesc_stats->syncp);
+-				++txdesc_stats->no_desc_avail;
+-				u64_stats_update_end(&txdesc_stats->syncp);
+-				netdev_dbg(netdev, "Not enough available descriptors are present at %d ring for SG packet. Needed %d, currently available %d\n",
+-					   txdesc_ring->id, num_tx_desc_needed,
+-					   txdesc_ring->avail_desc);
+-				return EDMA_TX_FAIL_NO_DESC;
+-			}
+-		}
+-
+ 		txdesc = edma_tx_skb_first_desc(port_priv, txdesc_ring, skb,
+ 						&hw_next_to_use, stats, src_vp);
+ 		if (unlikely(!txdesc)) {
+@@ -775,6 +776,7 @@ enum edma_tx_status edma_tx_ring_xmit(st
+ 			u64_stats_update_begin(&txdesc_stats->syncp);
+ 			++txdesc_stats->no_desc_avail;
+ 			u64_stats_update_end(&txdesc_stats->syncp);
++			atomic_add(num_tx_desc_needed, &txdesc_ring->avail_desc);
+ 			return EDMA_TX_FAIL_NO_DESC;
+ 		}
+ 
+@@ -788,10 +790,16 @@ enum edma_tx_status edma_tx_ring_xmit(st
+ 			u64_stats_update_begin(&txdesc_stats->syncp);
+ 			++txdesc_stats->no_desc_avail;
+ 			u64_stats_update_end(&txdesc_stats->syncp);
++			atomic_add(num_tx_desc_needed, &txdesc_ring->avail_desc);
+ 			return EDMA_TX_FAIL_NO_DESC;
+ 		}
+ 	}
+ 
++	/* Zero-length fragments are counted conservatively but not mapped. */
++	if (num_desc_filled < num_tx_desc_needed)
++		atomic_add(num_tx_desc_needed - num_desc_filled,
++			   &txdesc_ring->avail_desc);
++
+ 	/* The last descriptor owns the skb until all of the packet's DMA
+ 	 * descriptors have completed.
+ 	 */
+@@ -799,7 +807,6 @@ enum edma_tx_status edma_tx_ring_xmit(st
+ 
+ 	/* Update producer index. */
+ 	txdesc_ring->prod_idx = hw_next_to_use & EDMA_TXDESC_PROD_IDX_MASK;
+-	txdesc_ring->avail_desc -= num_desc_filled;
+ 
+ 	netdev_dbg(netdev, "%s: skb:%pK tx_ring:%u proto:0x%x skb->len:%d\n port:%u prod_idx:%u ip_summed:0x%x\n",
+ 		   netdev->name, skb, txdesc_ring->id, ntohs(skb->protocol),
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
+@@ -276,6 +276,8 @@ struct edma_txcmpl_desc {
+ 	u32 word3;
+ };
+ 
++struct edma_txdesc_ring;
++
+ /**
+  * struct edma_tx_buffer - software state for one Tx descriptor
+  * @dma: DMA address returned by the mapping API
+@@ -283,7 +285,8 @@ struct edma_txcmpl_desc {
+  * @mapped: whether @dma is currently mapped
+  * @page: whether the buffer was mapped with skb_frag_dma_map()
+  */
+ struct edma_tx_buffer {
++	struct edma_txdesc_ring *ring;
+ 	dma_addr_t dma;
+ 	struct sk_buff *skb;
+ 	u32 len;
+@@ -306,9 +309,9 @@ struct edma_tx_buffer {
+  * @fc_grp_id: Flow control group ID
+  */
+ struct edma_txdesc_ring {
+ 	u32 prod_idx;
+ 	u32 id;
+-	u32 avail_desc;
++	atomic_t avail_desc;
+ 	struct edma_txdesc_pri *pdesc;
+ 	dma_addr_t pdma;
+ 	struct edma_txdesc_sec *sdesc;
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_cfg_tx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_cfg_tx.c
+@@ -79,6 +79,7 @@ static int edma_cfg_tx_desc_ring_setup(s
+ {
+ 	struct ppe_device *ppe_dev = edma_ctx->ppe_dev;
+ 	struct device *dev = ppe_dev->dev;
++	u32 i;
+ 
+ 	txdesc_ring->pdesc = dma_alloc_coherent(dev, sizeof(struct edma_txdesc_pri)
+ 						* txdesc_ring->count,
+@@ -119,6 +120,10 @@ static int edma_cfg_tx_desc_ring_setup(s
+ 		return -ENOMEM;
+ 	}
+ 
++	for (i = 0; i < txdesc_ring->count; i++)
++		txdesc_ring->buf[i].ring = txdesc_ring;
++	atomic_set(&txdesc_ring->avail_desc, txdesc_ring->count - 1);
++
+ 	return 0;
+ }
+ 
