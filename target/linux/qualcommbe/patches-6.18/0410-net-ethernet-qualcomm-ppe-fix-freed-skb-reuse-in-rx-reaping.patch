@@ -1,5 +1,5 @@
 From: Kenneth Kasilag <kenneth@kasilag.me>
-Subject: [PATCH] net: ethernet: qualcomm: ppe: fix Rx skb ownership bugs
+Subject: [PATCH] net: ethernet: qualcomm: ppe: harden Rx buffer lifecycle
 
 The Rx reaping loop keeps the skb belonging to the next descriptor in
 next_skb, but only the paths that deliver the current frame reload it.
@@ -25,10 +25,129 @@ segment processing operate only on the live head skb.  Finally, leave a
 linear skb rejected by pskb_may_pull() owned by the reap loop; freeing it
 in both the helper and its caller otherwise double-frees it.
 
+RX buffers are also mapped with DMA_TO_DEVICE even though EDMA writes
+received packets into them, then unmapped with DMA_FROM_DEVICE.  Use the
+receive direction consistently.  Unmap buffers that are still owned by
+the fill or descriptor rings before freeing them during teardown, and
+release an incomplete scatter frame retained by a descriptor ring.
+
+Finally, edma_cfg_rx_napi_delete() already disables each registered NAPI
+instance.  Do not disable the same instances immediately before calling
+it, as napi_disable() calls must pair with napi_enable() calls.
+
 Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
+Co-developed-by: JiaY-shi <shi05275@163.com>
+Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.c
+@@ -743,6 +743,5 @@ static int edma_hw_configure(void)
+ edma_cfg_rx_rps_hash_map_failed:
+ configure_ucast_prio_map_tbl_failed:
+-	edma_cfg_rx_napi_disable();
+ 	edma_cfg_rx_napi_delete();
+ 	edma_cfg_rx_rings_disable();
+ edma_cfg_rx_rings_failed:
+@@ -799,7 +798,6 @@ void edma_destroy(struct ppe_device *ppe
+ 	kfree(edma_ctx->intr_info.intr_rx);
+ 	kfree(edma_ctx->intr_info.intr_txcmpl);
+ 
+-	edma_cfg_rx_napi_disable();
+ 	edma_cfg_rx_napi_delete();
+ 	edma_cfg_rx_rings_disable();
+ 	edma_cfg_rx_rings_cleanup();
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
+@@ -405,8 +405,12 @@ static void edma_cfg_rx_fill_ring_cleanu
+ 	struct regmap *regmap = ppe_dev->regmap;
+ 	struct device *dev = ppe_dev->dev;
+ 	u16 cons_idx, curr_idx;
++	u32 dma_map_size;
+ 	u32 data, reg;
+ 
++	dma_map_size = rxfill_ring->alloc_size - EDMA_RX_SKB_HEADROOM -
++		       NET_IP_ALIGN;
++
+ 	/* Get RxFill ring producer index */
+ 	curr_idx = rxfill_ring->prod_idx & EDMA_RXFILL_PROD_IDX_MASK;
+ 
+@@ -420,6 +422,7 @@ static void edma_cfg_rx_fill_ring_cleanu
+ 
+ 	while (curr_idx != cons_idx) {
+ 		struct edma_rxfill_desc *rxfill_desc;
++		dma_addr_t dma_addr;
+ 		struct sk_buff *skb;
+ 
+ 		/* Get RxFill descriptor */
+@@ -435,6 +438,14 @@ static void edma_cfg_rx_fill_ring_cleanu
+ 			continue;
+ 		}
+ 
++		dma_addr = EDMA_RXFILL_BUFFER_ADDR_GET(rxfill_desc);
++		if (!rxfill_ring->page_mode)
++			dma_unmap_single(dev, dma_addr, dma_map_size,
++					 DMA_FROM_DEVICE);
++		else
++			dma_unmap_page(dev, dma_addr, PAGE_SIZE,
++				       DMA_FROM_DEVICE);
++
+ 		dev_kfree_skb_any(skb);
+ 	}
+ 
+@@ -491,9 +502,14 @@ static void edma_cfg_rx_desc_ring_cleanu
+ {
+ 	struct ppe_device *ppe_dev = edma_ctx->ppe_dev;
+ 	struct regmap *regmap = ppe_dev->regmap;
++	bool page_mode = rxdesc_ring->rxfill->page_mode;
+ 	struct device *dev = ppe_dev->dev;
++	u32 dma_map_size;
+ 	u32 prod_idx, cons_idx, reg;
+ 
++	dma_map_size = rxdesc_ring->rxfill->alloc_size - EDMA_RX_SKB_HEADROOM -
++		       NET_IP_ALIGN;
++
+ 	/* Get Rxdesc consumer & producer indices */
+ 	cons_idx = rxdesc_ring->cons_idx & EDMA_RXDESC_CONS_IDX_MASK;
+ 
+@@ -506,6 +520,7 @@ static void edma_cfg_rx_desc_ring_cleanu
+ 	while (cons_idx != prod_idx) {
+ 		struct edma_rxdesc_pri *rxdesc_pri =
+ 			EDMA_RXDESC_PRI_DESC(rxdesc_ring, cons_idx);
++		dma_addr_t dma_addr;
+ 		struct sk_buff *skb;
+ 
+ 		/* Update consumer index */
+@@ -519,9 +534,22 @@ static void edma_cfg_rx_desc_ring_cleanu
+ 			continue;
+ 		}
+ 
++		dma_addr = EDMA_RXDESC_BUFFER_ADDR_GET(rxdesc_pri);
++		if (!page_mode)
++			dma_unmap_single(dev, dma_addr, dma_map_size,
++					 DMA_FROM_DEVICE);
++		else
++			dma_unmap_page(dev, dma_addr, PAGE_SIZE,
++				       DMA_FROM_DEVICE);
++
+ 		dev_kfree_skb_any(skb);
+ 	}
+ 
++	dev_kfree_skb_any(rxdesc_ring->head);
++	rxdesc_ring->head = NULL;
++	rxdesc_ring->last = NULL;
++	rxdesc_ring->pdesc_head = NULL;
++
+ 	/* Update the consumer index */
+ 	reg = EDMA_BASE_OFFSET + EDMA_REG_RXDESC_CONS_IDX(rxdesc_ring->ring_id);
+ 	regmap_write(regmap, reg, cons_idx);
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
+@@ -61 +61 @@ static int edma_rx_alloc_buffer_list(struct edma_rxfill_ring *rxfill_ring, int alloc_count)
+-			buff_addr = dma_map_single(dev, skb->data, dma_map_size, DMA_TO_DEVICE);
++			buff_addr = dma_map_single(dev, skb->data, dma_map_size, DMA_FROM_DEVICE);
+@@ -80 +80 @@ static int edma_rx_alloc_buffer_list(struct edma_rxfill_ring *rxfill_ring, int alloc_count)
+-			buff_addr = dma_map_page(dev, pg, 0, PAGE_SIZE, DMA_TO_DEVICE);
++			buff_addr = dma_map_page(dev, pg, 0, PAGE_SIZE, DMA_FROM_DEVICE);
 @@ -150,8 +150,7 @@ static inline uint8_t edma_rx_checksum_v
  }
  
@@ -109,3 +228,14 @@ Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
  		/* Handle scatter frame processing for first/middle/last segments. */
  		page_mode ? edma_rx_handle_nr_frags(rxdesc_ring, rxdesc_pri, skb) :
  			edma_rx_handle_frag_list(rxdesc_ring, rxdesc_pri, skb);
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
+@@ -123,6 +123,8 @@ static inline void EDMA_RXFILL_ENDIAN_SE
+ }
+ 
+ #define EDMA_RXFILL_BUFFER_ADDR_SET(desc, addr)	(((desc)->word0) = (u32)(addr))
++#define EDMA_RXFILL_BUFFER_ADDR_GET(desc)	\
++			((u32)le32_to_cpu((__force __le32)((desc)->word0)))
+ 
+ /* Opaque values are set in word2 and word3, they are not accessed by the EDMA HW,
+  * so endianness conversion is not needed.
