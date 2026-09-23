@@ -21,7 +21,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/drivers/net/dsa/yt921x.c
 +++ b/drivers/net/dsa/yt921x.c
-@@ -6279,14 +6279,24 @@
+@@ -6279,14 +6279,24 @@ static int yt922x_dsa_change_tag_protoco
  					  enum dsa_tag_protocol proto)
  {
  	struct yt921x_priv *priv = to_yt921x_priv(ds);
@@ -46,7 +46,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	mutex_unlock(&priv->reg_lock);
  
  	return res;
-@@ -6328,6 +6338,8 @@
+@@ -6328,6 +6338,8 @@ static int yt922x_dsa_setup(struct dsa_s
  	struct device_node *child;
  	int res;
  
@@ -55,7 +55,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	for (size_t i = 0; i < ARRAY_SIZE(priv->ports); i++) {
  		struct yt921x_port *pp = &priv->ports[i];
  
-@@ -6410,21 +6422,27 @@
+@@ -6410,21 +6422,27 @@ static void yt922x_dsa_teardown(struct d
  #define YT922X_FDB_PORT		GENMASK(15, 12)
  #define YT922X_BRIDGE_VID		1
  
@@ -85,7 +85,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  			return entry;
  	return NULL;
  }
-@@ -6434,6 +6452,7 @@
+@@ -6434,6 +6452,7 @@ struct yt922x_mdb_entry {
  	struct net_device *bridge;
  	unsigned char addr[ETH_ALEN];
  	u8 vids[YT921X_PORT_NUM];
@@ -93,7 +93,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  };
  
  static void yt922x_fdb_cleanup(void *data)
-@@ -6479,11 +6498,11 @@
+@@ -6479,11 +6498,11 @@ static int yt922x_fdb_op(struct yt921x_p
  	return 0;
  }
  
@@ -107,7 +107,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  		   get_unaligned_be16(addr + 4);
  	entry[2] = 0;
  	entry[3] = 0;
-@@ -6494,8 +6513,8 @@
+@@ -6494,8 +6513,8 @@ static bool yt922x_fdb_bridge_supported(
  {
  	struct dsa_port *dp;
  
@@ -118,7 +118,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  		return false;
  	if (dsa_is_user_port(&priv->ds, port))
  		return priv->ports[port].yt922x_bridge == db.bridge.dev;
-@@ -6514,11 +6533,15 @@
+@@ -6514,11 +6533,15 @@ yt922x_dsa_port_fdb_add(struct dsa_switc
  	struct yt921x_priv *priv = to_yt921x_priv(ds);
  	struct yt922x_fdb_entry *fdb, *new = NULL;
  	u32 entry[4], result;
@@ -136,7 +136,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	entry[1] |= FIELD_PREP(YT922X_FDB_STATUS, YT922X_FDB_STATIC);
  	entry[2] = YT922X_FDB_VALID | FIELD_PREP(YT922X_FDB_PORT, port);
  
-@@ -6528,9 +6551,9 @@
+@@ -6528,9 +6551,9 @@ yt922x_dsa_port_fdb_add(struct dsa_switc
  	} else if (!yt922x_fdb_bridge_supported(priv, port, vid, db)) {
  		ret = -EOPNOTSUPP;
  	} else {
@@ -148,7 +148,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  			ret = -EOPNOTSUPP;
  			goto out;
  		}
-@@ -6548,6 +6571,7 @@
+@@ -6548,6 +6571,7 @@ yt922x_dsa_port_fdb_add(struct dsa_switc
  		if (!ret) {
  			if (new) {
  				ether_addr_copy(fdb->addr, addr);
@@ -156,7 +156,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  				list_add_tail(&fdb->list, &priv->yt922x_fdb_entries);
  				new = NULL;
  			}
-@@ -6556,7 +6580,7 @@
+@@ -6556,7 +6580,7 @@ yt922x_dsa_port_fdb_add(struct dsa_switc
  				fdb->vids = 0;
  			fdb->port = port;
  			fdb->bridge = db.bridge.dev;
@@ -165,7 +165,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  		}
  	}
  out:
-@@ -6572,22 +6596,28 @@
+@@ -6572,22 +6596,28 @@ yt922x_dsa_port_fdb_del(struct dsa_switc
  	struct yt921x_priv *priv = to_yt921x_priv(ds);
  	struct yt922x_fdb_entry *fdb;
  	u32 entry[4], out[4], result;
@@ -200,7 +200,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  		goto out;
  	}
  	ret = yt922x_fdb_op(priv, entry, YT922X_FDB_GET, out, &result);
-@@ -6617,12 +6647,12 @@
+@@ -6617,12 +6647,12 @@ out:
  static void yt922x_bridge_quarantine(struct yt921x_priv *priv, int error);
  
  static int yt922x_mdb_write(struct yt921x_priv *priv,
@@ -215,7 +215,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	if (ports) {
  		/* Keep a CPU copy for local listeners and other bridge devices. */
  		ports |= priv->cpu_ports_mask;
-@@ -6645,14 +6675,19 @@
+@@ -6645,14 +6675,19 @@ static int yt922x_mdb_update(struct dsa_
  	struct yt921x_priv *priv = to_yt921x_priv(ds);
  	struct yt922x_mdb_entry *entry, *found = NULL, *new = NULL;
  	u16 ports = 0;
@@ -237,7 +237,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	mutex_lock(&priv->reg_lock);
  	if (priv->yt922x_bridge_broken) {
  		ret = -EIO;
-@@ -6663,7 +6698,8 @@
+@@ -6663,7 +6698,8 @@ static int yt922x_mdb_update(struct dsa_
  		goto out;
  	}
  	list_for_each_entry(entry, &priv->yt922x_mdb_entries, list) {
@@ -247,7 +247,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  			found = entry;
  			break;
  		}
-@@ -6678,17 +6714,18 @@
+@@ -6678,17 +6714,18 @@ static int yt922x_mdb_update(struct dsa_
  		}
  		ether_addr_copy(new->addr, mdb->addr);
  		new->bridge = db.bridge.dev;
@@ -269,7 +269,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	if (ret) {
  		if (ret != -ENOSPC)
  			yt922x_bridge_quarantine(priv, ret);
-@@ -6729,6 +6766,7 @@
+@@ -6729,6 +6766,7 @@ static int yt922x_dsa_port_fdb_dump(stru
  	struct yt921x_priv *priv = to_yt921x_priv(ds);
  	u32 in[4] = {}, entry[4], command, result, index = 0, next;
  	unsigned char addr[ETH_ALEN];
@@ -277,7 +277,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	int i, ret;
  
  	/* NEXT excludes its starting index, so read slot zero explicitly. */
-@@ -6755,13 +6793,14 @@
+@@ -6755,13 +6793,14 @@ static int yt922x_dsa_port_fdb_dump(stru
  				 YT922X_FDB_PENDING)) ||
  		    !FIELD_GET(YT922X_FDB_STATUS, entry[1]) ||
  		    FIELD_GET(YT922X_FDB_PORT, entry[2]) != port ||
@@ -294,7 +294,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  			 YT922X_FDB_STATIC, data);
  		if (ret)
  			return ret;
-@@ -6866,6 +6905,153 @@
+@@ -6866,6 +6905,153 @@ static void yt922x_bridge_quarantine(str
  		error);
  }
  
@@ -448,7 +448,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  static int
  yt922x_dsa_port_bridge_join(struct dsa_switch *ds, int port,
  			    struct dsa_bridge bridge, bool *tx_fwd_offload,
-@@ -6874,10 +7060,18 @@
+@@ -6874,10 +7060,18 @@ yt922x_dsa_port_bridge_join(struct dsa_s
  	struct yt921x_priv *priv = to_yt921x_priv(ds);
  	struct yt921x_port *p = &priv->ports[port];
  	struct dsa_port *dp;
@@ -469,7 +469,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  		return -EOPNOTSUPP;
  	}
  	/* DSA does not inherit every bridge flag after joining. Validate the
-@@ -6906,6 +7100,30 @@
+@@ -6906,6 +7100,30 @@ yt922x_dsa_port_bridge_join(struct dsa_s
  			goto out;
  		}
  	}
@@ -500,7 +500,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	p->yt922x_bridge = bridge.dev;
  	p->yt922x_stp_state = BR_STATE_DISABLED;
  	p->yt922x_learning = false;
-@@ -6942,6 +7160,8 @@
+@@ -6942,6 +7160,8 @@ yt922x_dsa_port_bridge_leave(struct dsa_
  		ret = yt922x_bridge_matrix(priv);
  	if (!ret)
  		ret = yt922x_bridge_fast_age(priv, port);
@@ -509,7 +509,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	if (ret)
  		yt922x_bridge_quarantine(priv, ret);
  	mutex_unlock(&priv->reg_lock);
-@@ -7043,13 +7263,36 @@
+@@ -7043,13 +7263,36 @@ yt922x_dsa_port_vlan_filtering(struct ds
  			       struct netlink_ext_ack *extack)
  {
  	struct yt921x_priv *priv = to_yt921x_priv(ds);
@@ -549,7 +549,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  }
  
  static int yt922x_dsa_set_ageing_time(struct dsa_switch *ds, unsigned int msecs)
-@@ -7077,6 +7320,9 @@
+@@ -7077,6 +7320,9 @@ static const struct dsa_switch_ops yt922
  	.port_pre_bridge_flags	= yt922x_dsa_port_pre_bridge_flags,
  	.port_bridge_flags	= yt922x_dsa_port_bridge_flags,
  	.port_vlan_filtering	= yt922x_dsa_port_vlan_filtering,
@@ -559,7 +559,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	.set_ageing_time		= yt922x_dsa_set_ageing_time,
  	/* port */
  	.get_tag_protocol	= yt922x_dsa_get_tag_protocol,
-@@ -7191,6 +7437,12 @@
+@@ -7191,6 +7437,12 @@ static int yt921x_mdio_probe(struct mdio
  		return ret;
  
  	priv->series_info = compat_info;
@@ -574,7 +574,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  
 --- a/drivers/net/dsa/yt921x.h
 +++ b/drivers/net/dsa/yt921x.h
-@@ -1096,6 +1096,9 @@
+@@ -1096,6 +1096,9 @@ struct yt921x_priv {
  	/* Static VID 0/1 aliases, protected by reg_lock. */
  	struct list_head yt922x_fdb_entries;
  	struct list_head yt922x_mdb_entries;
@@ -594,7 +594,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  #include <linux/dsa/yt922x.h>
  
  #include "tag.h"
-@@ -108,6 +109,56 @@
+@@ -108,6 +109,56 @@ static const struct dsa_device_ops yt922
  	.needed_headroom = YT922X_TAG_LEN,
  };
  
@@ -651,7 +651,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  static struct sk_buff *
  yt922x_4b_tag_xmit(struct sk_buff *skb, struct net_device *netdev)
  {
-@@ -118,6 +169,10 @@
+@@ -118,6 +169,10 @@ yt922x_4b_tag_xmit(struct sk_buff *skb,
  	if (unlikely(!ctrl))
  		return NULL;
  
@@ -662,7 +662,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	skb_push(skb, VLAN_HLEN);
  	dsa_alloc_etype_header(skb, VLAN_HLEN);
  	tag = dsa_etype_header_pos_tx(skb);
-@@ -174,7 +229,8 @@
+@@ -174,7 +229,8 @@ static const struct dsa_device_ops yt922
  	.proto = DSA_TAG_PROTO_YT922X_4B,
  	.xmit = yt922x_4b_tag_xmit,
  	.rcv = yt922x_4b_tag_rcv,
@@ -674,7 +674,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  DSA_TAG_DRIVER(yt922x_netdev_ops);
 --- a/drivers/net/ethernet/mediatek/mtk_ppe.c
 +++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
-@@ -801,6 +801,20 @@
+@@ -801,6 +801,20 @@ void __mtk_ppe_check_skb(struct mtk_ppe
  	int entry_len;
  	u8 *tag;
  
@@ -697,7 +697,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	if (FIELD_GET(MTK_FOE_IB1_STATE, hwe->ib1) == MTK_FOE_STATE_BIND)
 --- a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
 +++ b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
-@@ -206,6 +206,11 @@
+@@ -206,6 +206,11 @@ mtk_flow_get_dsa_port(struct net_device
  			*push_vid = dsa_tag_8021q_standalone_vid(dp);
  		break;
  	case DSA_TAG_PROTO_YT922X_4B:
@@ -711,7 +711,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  		if (push_vid)
 --- a/include/net/dsa.h
 +++ b/include/net/dsa.h
-@@ -1068,6 +1068,9 @@
+@@ -1068,6 +1068,9 @@ struct dsa_switch_ops {
  	int	(*port_vlan_filtering)(struct dsa_switch *ds, int port,
  				       bool vlan_filtering,
  				       struct netlink_ext_ack *extack);
@@ -723,7 +723,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  				 struct netlink_ext_ack *extack);
 --- a/net/dsa/user.c
 +++ b/net/dsa/user.c
-@@ -612,6 +612,14 @@
+@@ -612,6 +612,14 @@ static int dsa_user_port_attr_set(struct
  		ret = dsa_port_vlan_filtering(dp, attr->u.vlan_filtering,
  					      extack);
  		break;

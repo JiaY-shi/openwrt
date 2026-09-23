@@ -12,7 +12,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/drivers/net/dsa/yt921x.c
 +++ b/drivers/net/dsa/yt921x.c
-@@ -5793,10 +5793,40 @@
+@@ -5793,10 +5793,40 @@ yt922x_pcs_get_state(struct phylink_pcs
  {
  	struct yt921x_port *pp = container_of(pcs, struct yt921x_port, pcs);
  	struct yt921x_priv *priv = pp->priv;
@@ -54,7 +54,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	if (state->interface == PHY_INTERFACE_MODE_10GBASER) {
  		/* MAC status reflects software overrides, not the SerDes link. */
  		mutex_lock(&priv->reg_lock);
-@@ -5880,19 +5910,71 @@
+@@ -5880,19 +5910,71 @@ static int yt922x_pcs_config(struct phyl
  {
  	struct yt921x_port *pp = container_of(pcs, struct yt921x_port, pcs);
  	struct yt921x_priv *priv = pp->priv;
@@ -132,7 +132,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  static void yt922x_pcs_disable(struct phylink_pcs *pcs)
  {
  	struct yt921x_port *pp = container_of(pcs, struct yt921x_port, pcs);
-@@ -5907,6 +5989,7 @@
+@@ -5907,6 +5989,7 @@ static void yt922x_pcs_disable(struct ph
  static const struct phylink_pcs_ops yt922x_pcs_ops = {
  	.pcs_enable	= yt922x_pcs_enable,
  	.pcs_config	= yt922x_pcs_config,

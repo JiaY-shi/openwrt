@@ -16,8 +16,6 @@ still requires validation on the resulting firmware.
 
 Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
-diff --git a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
-index df53e16..52723ee 100644
 --- a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
 +++ b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
 @@ -11,6 +11,7 @@
@@ -28,7 +26,7 @@ index df53e16..52723ee 100644
  #include "mtk_eth_soc.h"
  #include "mtk_wed.h"
  
-@@ -174,7 +175,8 @@ mtk_flow_mangle_ipv4(const struct flow_action_entry *act,
+@@ -174,7 +175,8 @@ mtk_flow_mangle_ipv4(const struct flow_a
   * magic etype later via mtk_foe_entry_set_dsa()) or the outer 802.1Q
   * VID the PPE should push on the egressing frame (tag_8021q taggers
   * that use an outer Q-in-Q tag with a standalone per-port VID, i.e.
@@ -38,7 +36,7 @@ index df53e16..52723ee 100644
   *
   * push_vid may be NULL for callers that only want the idev->conduit
   * substitution (e.g. ingress-side ppe_idx selection, where no VID
-@@ -203,6 +205,12 @@ mtk_flow_get_dsa_port(struct net_device **dev, u16 *push_vid)
+@@ -203,6 +205,12 @@ mtk_flow_get_dsa_port(struct net_device
  		if (push_vid)
  			*push_vid = dsa_tag_8021q_standalone_vid(dp);
  		break;
@@ -51,7 +49,7 @@ index df53e16..52723ee 100644
  	default:
  		return -ENODEV;
  	}
-@@ -218,11 +226,11 @@ mtk_flow_get_dsa_port(struct net_device **dev, u16 *push_vid)
+@@ -218,11 +226,11 @@ mtk_flow_get_dsa_port(struct net_device
  static int
  mtk_flow_set_output_device(struct mtk_eth *eth, struct mtk_foe_entry *foe,
  			   struct net_device *dev, const u8 *dest_mac,
@@ -65,7 +63,7 @@ index df53e16..52723ee 100644
  	u16 push_vid = 0;
  
  	if (mtk_flow_get_wdma_info(dev, dest_mac, &info) == 0) {
-@@ -261,10 +269,18 @@ mtk_flow_set_output_device(struct mtk_eth *eth, struct mtk_foe_entry *foe,
+@@ -261,10 +269,18 @@ mtk_flow_set_output_device(struct mtk_et
  		return -EOPNOTSUPP;
  
  	if (dsa_port >= 0) {
@@ -87,7 +85,7 @@ index df53e16..52723ee 100644
  	}
  
  	if (dsa_port >= 0 && dsa_port < MTK_DSA_USER_PORT_MAX) {
-@@ -521,7 +537,7 @@ mtk_flow_offload_replace(struct mtk_eth *eth, struct flow_cls_offload *f,
+@@ -521,7 +537,7 @@ mtk_flow_offload_replace(struct mtk_eth
  	}
  
  	err = mtk_flow_set_output_device(eth, &foe, odev, data.eth.h_dest,
@@ -95,3 +93,4 @@ index df53e16..52723ee 100644
 +					 &wed_index, data.vlan.num);
  	if (err)
  		return err;
+ 

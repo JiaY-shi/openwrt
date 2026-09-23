@@ -11,7 +11,7 @@ the way DSA honours "label" for switch ports, so no userspace rename is needed.
 
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-@@ -5252,6 +5252,20 @@ static int mtk_fill_available_pcs(struct
+@@ -5240,6 +5240,20 @@ static int mtk_fill_available_pcs(struct
  	return 0;
  }
  
@@ -32,7 +32,7 @@ the way DSA honours "label" for switch ports, so no userspace rename is needed.
  static int mtk_add_mac(struct mtk_eth *eth, struct device_node *np)
  {
  	const __be32 *_id = of_get_property(np, "reg", NULL);
-@@ -5442,6 +5456,7 @@ no_pcs:
+@@ -5430,6 +5444,7 @@ no_pcs:
  			  mac->phylink_config.supported_interfaces);
  
  	SET_NETDEV_DEV(eth->netdev[id], eth->dev);

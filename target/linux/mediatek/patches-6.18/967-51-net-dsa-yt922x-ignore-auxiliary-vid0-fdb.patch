@@ -11,7 +11,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/drivers/net/dsa/yt921x.c
 +++ b/drivers/net/dsa/yt921x.c
-@@ -6539,6 +6539,14 @@
+@@ -6539,6 +6539,14 @@ yt922x_dsa_port_fdb_add(struct dsa_switc
  
  	if (!is_valid_ether_addr(addr) || db.type != DSA_DB_BRIDGE)
  		return -EOPNOTSUPP;
@@ -26,7 +26,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	hwvid = br_vlan_enabled(db.bridge.dev) ? vid : YT922X_BRIDGE_VID;
  	alias = br_vlan_enabled(db.bridge.dev) ? 0 : vid;
  	yt922x_fdb_key(addr, hwvid, entry);
-@@ -6603,6 +6611,8 @@
+@@ -6603,6 +6611,8 @@ yt922x_dsa_port_fdb_del(struct dsa_switc
  	if (vid >= VLAN_VID_MASK || db.type != DSA_DB_BRIDGE ||
  	    !is_valid_ether_addr(addr))
  		return -EOPNOTSUPP;

@@ -17,10 +17,8 @@ Signed-off-by: Pietro Ameruoso <p.ameruoso@live.it>
  drivers/net/pcs/pcs-mtk-usxgmii.c | 3 +++
  1 file changed, 3 insertions(+)
 
-Index: linux-6.18.44/drivers/net/pcs/pcs-mtk-usxgmii.c
-===================================================================
---- linux-6.18.44.orig/drivers/net/pcs/pcs-mtk-usxgmii.c
-+++ linux-6.18.44/drivers/net/pcs/pcs-mtk-usxgmii.c
+--- a/drivers/net/pcs/pcs-mtk-usxgmii.c
++++ b/drivers/net/pcs/pcs-mtk-usxgmii.c
 @@ -423,6 +423,11 @@ static void mtk_usxgmii_pcs_link_up(stru
  	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
  	unsigned long timeout = jiffies + msecs_to_jiffies(10000);

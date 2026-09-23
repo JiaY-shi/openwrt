@@ -19,7 +19,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/drivers/net/dsa/yt921x.c
 +++ b/drivers/net/dsa/yt921x.c
-@@ -6249,10 +6249,14 @@
+@@ -6249,10 +6249,14 @@ static int yt922x_dsa_setup(struct dsa_s
  		pp->pcs.poll = true;
  		pp->fixed_usxgmii_10g = false;
  		pp->conduit_operational = false;
@@ -34,7 +34,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	res = yt922x_chip_reset(priv);
  	mutex_unlock(&priv->reg_lock);
  	if (res)
-@@ -6288,7 +6292,319 @@
+@@ -6288,7 +6292,319 @@ static void yt922x_dsa_teardown(struct d
  	yt922x_cpu_mac_stop(to_yt921x_priv(ds));
  }
  
@@ -356,7 +356,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	.change_tag_protocol	= yt922x_dsa_change_tag_protocol,
 --- a/drivers/net/dsa/yt921x.h
 +++ b/drivers/net/dsa/yt921x.h
-@@ -1034,6 +1034,11 @@
+@@ -1034,6 +1034,11 @@ struct yt921x_port {
  	struct delayed_work cpu_mac_work;
  	bool fixed_usxgmii_10g;
  	bool conduit_operational;
@@ -368,7 +368,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  };
  
  struct yt921x_reg_ops {
-@@ -1079,6 +1084,7 @@
+@@ -1079,6 +1084,7 @@ struct yt921x_priv {
  
  	struct yt921x_port ports[YT921X_PORT_NUM];
  	bool cpu_mac_stopping;
@@ -378,7 +378,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  
 --- a/net/dsa/tag_yt922x.c
 +++ b/net/dsa/tag_yt922x.c
-@@ -91,6 +91,12 @@
+@@ -91,6 +91,12 @@ yt922x_tag_rcv(struct sk_buff *skb, stru
  	skb_pull_rcsum(skb, YT922X_TAG_LEN);
  	dsa_strip_etype_header(skb, YT922X_TAG_LEN);
  
@@ -391,7 +391,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	return skb;
  }
  
-@@ -152,6 +158,9 @@
+@@ -152,6 +158,9 @@ yt922x_4b_tag_rcv(struct sk_buff *skb, s
  		return NULL;
  	skb->dev = user;
  
@@ -400,3 +400,4 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 +
  	return skb;
  }
+ 

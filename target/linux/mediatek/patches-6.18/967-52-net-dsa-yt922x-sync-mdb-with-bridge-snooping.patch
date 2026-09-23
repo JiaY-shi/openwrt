@@ -15,7 +15,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/drivers/net/dsa/yt921x.c
 +++ b/drivers/net/dsa/yt921x.c
-@@ -6735,7 +6735,12 @@
+@@ -6735,7 +6735,12 @@ static int yt922x_mdb_update(struct dsa_
  	for (p = 0; p < ARRAY_SIZE(found->vids); p++)
  		if (p == port ? vids : found->vids[p])
  			ports |= BIT(p);
@@ -29,7 +29,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	if (ret) {
  		if (ret != -ENOSPC)
  			yt922x_bridge_quarantine(priv, ret);
-@@ -6756,6 +6761,43 @@
+@@ -6756,6 +6761,43 @@ out:
  	return ret;
  }
  
@@ -73,7 +73,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  static int yt922x_dsa_port_mdb_add(struct dsa_switch *ds, int port,
  				   const struct switchdev_obj_port_mdb *mdb,
  				   struct dsa_db db)
-@@ -7320,6 +7362,7 @@
+@@ -7320,6 +7362,7 @@ static int yt922x_dsa_set_ageing_time(st
  static const struct dsa_switch_ops yt922x_dsa_switch_ops = {
  	.port_bridge_join	= yt922x_dsa_port_bridge_join,
  	.port_mdb_add		= yt922x_dsa_port_mdb_add,
@@ -83,7 +83,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	.port_fdb_del		= yt922x_dsa_port_fdb_del,
 --- a/include/net/dsa.h
 +++ b/include/net/dsa.h
-@@ -1061,6 +1061,9 @@
+@@ -1061,6 +1061,9 @@ struct dsa_switch_ops {
  				     struct netlink_ext_ack *extack);
  	void	(*port_set_host_flood)(struct dsa_switch *ds, int port,
  				       bool uc, bool mc);
@@ -95,7 +95,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	 * VLAN support
 --- a/net/dsa/user.c
 +++ b/net/dsa/user.c
-@@ -620,6 +620,15 @@
+@@ -620,6 +620,15 @@ static int dsa_user_port_attr_set(struct
  		ret = dp->ds->ops->port_vlan_protocol_validate(dp->ds, dp->index,
  							    attr->u.vlan_protocol, extack);
  		break;

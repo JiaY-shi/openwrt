@@ -17,7 +17,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/net/bridge/br_fdb.c
 +++ b/net/bridge/br_fdb.c
-@@ -1222,6 +1222,7 @@
+@@ -1222,6 +1222,7 @@ static int fdb_add_entry(struct net_brid
  			return -EEXIST;
  
  		if (READ_ONCE(fdb->dst) != source) {
