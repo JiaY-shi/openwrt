@@ -21,7 +21,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/drivers/net/ethernet/mediatek/mtk_ppe.c
 +++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
-@@ -833,12 +833,30 @@
+@@ -833,12 +833,30 @@ void __mtk_ppe_check_skb(struct mtk_ppe
  	switch (skb->protocol) {
  #if IS_ENABLED(CONFIG_NET_DSA)
  	case htons(ETH_P_XDSA):

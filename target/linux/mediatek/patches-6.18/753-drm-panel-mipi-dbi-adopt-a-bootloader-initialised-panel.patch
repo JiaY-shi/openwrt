@@ -1,6 +1,6 @@
 --- a/drivers/gpu/drm/tiny/panel-mipi-dbi.c
 +++ b/drivers/gpu/drm/tiny/panel-mipi-dbi.c
-@@ -116,6 +116,7 @@
+@@ -116,6 +116,7 @@ struct panel_mipi_dbi_config {
  struct panel_mipi_dbi_commands {
  	const u8 *buf;
  	size_t len;
@@ -8,7 +8,7 @@
  };
  
  static struct panel_mipi_dbi_commands *
-@@ -237,6 +238,7 @@
+@@ -237,6 +238,7 @@ static void panel_mipi_dbi_enable(struct
  				  struct drm_plane_state *plane_state)
  {
  	struct mipi_dbi_dev *dbidev = drm_to_mipi_dbi_dev(pipe->crtc.dev);
@@ -16,7 +16,7 @@
  	struct mipi_dbi *dbi = &dbidev->dbi;
  	int ret, idx;
  
-@@ -245,11 +247,42 @@
+@@ -245,11 +247,42 @@ static void panel_mipi_dbi_enable(struct
  
  	drm_dbg(pipe->crtc.dev, "\n");
  
@@ -60,7 +60,7 @@
  
  	mipi_dbi_enable_flush(dbidev, crtc_state, plane_state);
  out_exit:
-@@ -318,8 +351,10 @@
+@@ -318,8 +351,10 @@ static int panel_mipi_dbi_spi_probe(stru
  	struct device *dev = &spi->dev;
  	struct drm_display_mode mode;
  	struct mipi_dbi_dev *dbidev;
@@ -71,7 +71,7 @@
  	struct gpio_desc *dc;
  	unsigned int bpp;
  	size_t buf_size;
-@@ -367,9 +402,21 @@
+@@ -367,9 +402,21 @@ static int panel_mipi_dbi_spi_probe(stru
  	if (device_property_present(dev, "write-only"))
  		dbi->read_commands = NULL;
  
@@ -96,7 +96,7 @@
  
  	ret = panel_mipi_dbi_get_format(dev, formats, &bpp);
  	if (ret)
-@@ -390,10 +437,18 @@
+@@ -390,10 +437,18 @@ static int panel_mipi_dbi_spi_probe(stru
  
  	spi_set_drvdata(spi, drm);
  

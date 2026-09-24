@@ -16,7 +16,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/drivers/net/dsa/yt921x.c
 +++ b/drivers/net/dsa/yt921x.c
-@@ -6282,7 +6282,11 @@
+@@ -6282,7 +6282,11 @@ static int yt922x_dsa_change_tag_protoco
  	int res;
  
  	mutex_lock(&priv->reg_lock);
@@ -29,7 +29,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	mutex_unlock(&priv->reg_lock);
  
  	return res;
-@@ -6425,15 +6429,27 @@
+@@ -6425,15 +6429,27 @@ yt922x_fdb_find(struct yt921x_priv *priv
  	return NULL;
  }
  
@@ -57,7 +57,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  }
  
  /* Caller holds reg_lock for the entire indirect-table transaction. */
-@@ -6598,6 +6614,115 @@
+@@ -6598,6 +6614,115 @@ out:
  	return ret;
  }
  
@@ -173,7 +173,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  static int yt922x_dsa_port_fdb_dump(struct dsa_switch *ds, int port,
  				    dsa_fdb_dump_cb_t *cb, void *data)
  {
-@@ -6941,6 +7066,8 @@
+@@ -6941,6 +7066,8 @@ static int yt922x_dsa_set_ageing_time(st
  
  static const struct dsa_switch_ops yt922x_dsa_switch_ops = {
  	.port_bridge_join	= yt922x_dsa_port_bridge_join,
@@ -182,7 +182,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	.port_fdb_add		= yt922x_dsa_port_fdb_add,
  	.port_fdb_del		= yt922x_dsa_port_fdb_del,
  	.port_fdb_dump		= yt922x_dsa_port_fdb_dump,
-@@ -7058,6 +7185,7 @@
+@@ -7058,6 +7185,7 @@ static int yt921x_mdio_probe(struct mdio
  
  	mutex_init(&priv->reg_lock);
  	INIT_LIST_HEAD(&priv->yt922x_fdb_entries);
@@ -192,7 +192,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  		return ret;
 --- a/drivers/net/dsa/yt921x.h
 +++ b/drivers/net/dsa/yt921x.h
-@@ -1095,6 +1095,7 @@
+@@ -1095,6 +1095,7 @@ struct yt921x_priv {
  
  	/* Static VID 0/1 aliases, protected by reg_lock. */
  	struct list_head yt922x_fdb_entries;
@@ -202,7 +202,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  #endif
 --- a/net/dsa/tag_yt922x.c
 +++ b/net/dsa/tag_yt922x.c
-@@ -158,7 +158,12 @@
+@@ -158,7 +158,12 @@ yt922x_4b_tag_rcv(struct sk_buff *skb, s
  		return NULL;
  	skb->dev = user;
  

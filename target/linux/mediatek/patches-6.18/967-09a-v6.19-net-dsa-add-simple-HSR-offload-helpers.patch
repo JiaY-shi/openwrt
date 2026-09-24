@@ -87,7 +87,7 @@ Signed-off-by: Jakub Kicinski <kuba@kernel.org>
  #include <linux/list.h>
  #include <linux/module.h>
  #include <linux/netdevice.h>
-@@ -1769,6 +1770,70 @@ bool dsa_mdb_present_in_other_db(struct
+@@ -1774,6 +1775,70 @@ bool dsa_mdb_present_in_other_db(struct
  }
  EXPORT_SYMBOL_GPL(dsa_mdb_present_in_other_db);
  

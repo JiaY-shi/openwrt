@@ -18,8 +18,6 @@ the protocol at setup or switch it through its normal interface.
 
 Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
-diff --git a/Documentation/devicetree/bindings/net/dsa/dsa-port.yaml b/Documentation/devicetree/bindings/net/dsa/dsa-port.yaml
-index 4801204..814c4a1 100644
 --- a/Documentation/devicetree/bindings/net/dsa/dsa-port.yaml
 +++ b/Documentation/devicetree/bindings/net/dsa/dsa-port.yaml
 @@ -58,6 +58,8 @@ properties:
@@ -31,18 +29,19 @@ index 4801204..814c4a1 100644
  
  # CPU and DSA ports must have phylink-compatible link descriptions
  if:
-diff --git a/drivers/net/dsa/yt921x.c b/drivers/net/dsa/yt921x.c
-index b738c06..442c0d8 100644
 --- a/drivers/net/dsa/yt921x.c
 +++ b/drivers/net/dsa/yt921x.c
-@@ -6142,30 +6142,66 @@ static int yt922x_chip_setup(struct yt921x_priv *priv)
+@@ -6142,30 +6142,66 @@ static int yt922x_chip_setup(struct yt92
  	return 0;
  }
  
 -static int yt922x_cpu_tag_mode_set_8b(struct yt921x_priv *priv)
 +static int yt922x_cpu_tag_mode_set(struct yt921x_priv *priv,
 +				   enum dsa_tag_protocol proto)
-+{
+ {
+-	u32 val;
+-	u32 val1;
+-	int res;
 +	static const u32 regs[] = {
 +		YT921X_CPU_TAG_TPID,
 +		YT922X_CPU_TAG_RX_CTRL,
@@ -51,7 +50,23 @@ index b738c06..442c0d8 100644
 +	u32 saved[ARRAY_SIZE(regs)], next[ARRAY_SIZE(regs)];
 +	bool four_byte = proto == DSA_TAG_PROTO_YT922X_4B;
 +	int i, res, err;
-+
+ 
+-	/* cpu tag mode set to 8b*/
+-	res = yt921x_reg_read(priv, YT922X_CPU_TAG_RX_CTRL, &val);
+-	if (res)
+-		return res;
+-	res = yt921x_reg_read(priv, YT922X_CPU_TAG_TX_CTRL, &val1);
+-	if (res)
+-		return res;
+-	val &= ~YT922X_CPU_TAG_RX_MODE;
+-	val1 &= ~YT922X_CPU_TAG_TX_MODE;
+-	val1 &= ~YT922X_CPU_TAG_TX_TYPE;
+-	res = yt921x_reg_write(priv, YT922X_CPU_TAG_RX_CTRL, val);
+-	if (res)
+-		return res;
+-	res = yt921x_reg_write(priv, YT922X_CPU_TAG_TX_CTRL, val1);
+-	if (res)
+-		return res;
 +	if (proto != DSA_TAG_PROTO_YT922X && !four_byte)
 +		return -EOPNOTSUPP;
 +
@@ -76,8 +91,8 @@ index b738c06..442c0d8 100644
 +		if (res)
 +			goto restore;
 +	}
-+
-+	return 0;
+ 
+ 	return 0;
 +
 +restore:
 +	for (i = ARRAY_SIZE(regs) - 1; i >= 0; i--) {
@@ -91,38 +106,19 @@ index b738c06..442c0d8 100644
 +
 +static int yt922x_dsa_change_tag_protocol(struct dsa_switch *ds,
 +					  enum dsa_tag_protocol proto)
- {
--	u32 val;
--	u32 val1;
++{
 +	struct yt921x_priv *priv = to_yt921x_priv(ds);
- 	int res;
- 
--	/* cpu tag mode set to 8b*/
--	res = yt921x_reg_read(priv, YT922X_CPU_TAG_RX_CTRL, &val);
--	if (res)
--		return res;
--	res = yt921x_reg_read(priv, YT922X_CPU_TAG_TX_CTRL, &val1);
--	if (res)
--		return res;
--	val &= ~YT922X_CPU_TAG_RX_MODE;
--	val1 &= ~YT922X_CPU_TAG_TX_MODE;
--	val1 &= ~YT922X_CPU_TAG_TX_TYPE;
--	res = yt921x_reg_write(priv, YT922X_CPU_TAG_RX_CTRL, val);
--	if (res)
--		return res;
--	res = yt921x_reg_write(priv, YT922X_CPU_TAG_TX_CTRL, val1);
--	if (res)
--		return res;
++	int res;
++
 +	mutex_lock(&priv->reg_lock);
 +	res = yt922x_cpu_tag_mode_set(priv, proto);
 +	mutex_unlock(&priv->reg_lock);
- 
--	return 0;
++
 +	return res;
  }
  
  static int yt922x_cpu_port_set(struct yt921x_priv *priv)
-@@ -6175,7 +6211,7 @@ static int yt922x_cpu_port_set(struct yt921x_priv *priv)
+@@ -6175,7 +6211,7 @@ static int yt922x_cpu_port_set(struct yt
  	int res;
  
  	/* cpu tag mode */
@@ -131,7 +127,7 @@ index b738c06..442c0d8 100644
  	if (res)
  		return res;
  
-@@ -6255,6 +6291,7 @@ static void yt922x_dsa_teardown(struct dsa_switch *ds)
+@@ -6255,6 +6291,7 @@ static void yt922x_dsa_teardown(struct d
  static const struct dsa_switch_ops yt922x_dsa_switch_ops = {
  	/* port */
  	.get_tag_protocol	= yt922x_dsa_get_tag_protocol,
@@ -139,9 +135,6 @@ index b738c06..442c0d8 100644
  	.phylink_get_caps	= yt922x_dsa_phylink_get_caps,
  	.port_setup		= yt922x_dsa_port_setup,
  	/* chip */
-diff --git a/include/linux/dsa/yt922x.h b/include/linux/dsa/yt922x.h
-new file mode 100644
-index 0000000..8d9f7d6
 --- /dev/null
 +++ b/include/linux/dsa/yt922x.h
 @@ -0,0 +1,24 @@
@@ -169,8 +162,6 @@ index 0000000..8d9f7d6
 +}
 +
 +#endif
-diff --git a/include/net/dsa.h b/include/net/dsa.h
-index a1b3f2d..79006bf 100644
 --- a/include/net/dsa.h
 +++ b/include/net/dsa.h
 @@ -59,6 +59,7 @@ struct tc_action;
@@ -189,8 +180,6 @@ index a1b3f2d..79006bf 100644
  };
  
  struct dsa_switch;
-diff --git a/net/dsa/tag_yt922x.c b/net/dsa/tag_yt922x.c
-index 5d1b8d0..84f68b2 100644
 --- a/net/dsa/tag_yt922x.c
 +++ b/net/dsa/tag_yt922x.c
 @@ -7,6 +7,7 @@
@@ -201,7 +190,7 @@ index 5d1b8d0..84f68b2 100644
  
  #include "tag.h"
  
-@@ -101,8 +102,77 @@ static const struct dsa_device_ops yt922x_netdev_ops = {
+@@ -101,8 +102,77 @@ static const struct dsa_device_ops yt922
  	.needed_headroom = YT922X_TAG_LEN,
  };
  

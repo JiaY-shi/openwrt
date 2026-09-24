@@ -48,7 +48,7 @@ Signed-off-by: Chad Monroe <chad@monroe.io>
  
 --- a/drivers/net/phy/realtek/realtek_main.c
 +++ b/drivers/net/phy/realtek/realtek_main.c
-@@ -163,6 +163,8 @@
+@@ -176,6 +176,8 @@
  
  #define RTL8224_SRAM_RTCT_FAULT(pair)		(0x8026 + (pair) * 4)
  #define RTL8224_SRAM_RTCT_FAULT_BUSY		BIT(0)
@@ -57,7 +57,7 @@ Signed-off-by: Chad Monroe <chad@monroe.io>
  #define RTL8224_SRAM_RTCT_FAULT_OPEN		BIT(3)
  #define RTL8224_SRAM_RTCT_FAULT_SAME_SHORT	BIT(4)
  #define RTL8224_SRAM_RTCT_FAULT_OK		BIT(5)
-@@ -206,6 +208,8 @@
+@@ -219,6 +221,8 @@
  #define RTL_8221B_VM_CG				0x001cc84a
  #define RTL_8251B				0x001cc862
  #define RTL_8261C				0x001cc890
@@ -66,7 +66,7 @@ Signed-off-by: Chad Monroe <chad@monroe.io>
  #define RTL_8261N				0x001ccaf3
  #define RTL_8264				0x001ccaf2
  #define RTL_8264B				0x001cc813
-@@ -226,6 +230,40 @@
+@@ -240,6 +244,40 @@
  
  #define RTL826X_VND2_INSR			0xA43A
  
@@ -107,7 +107,7 @@ Signed-off-by: Chad Monroe <chad@monroe.io>
  MODULE_DESCRIPTION("Realtek PHY driver");
  MODULE_AUTHOR("Johnson Leung");
  MODULE_LICENSE("GPL");
-@@ -1816,6 +1854,10 @@ static int rtl8224_cable_test_result_tra
+@@ -1976,6 +2014,10 @@ static int rtl8224_cable_test_result_tra
  	if (result & RTL8224_SRAM_RTCT_FAULT_CROSS_SHORT)
  		return ETHTOOL_A_CABLE_RESULT_CODE_CROSS_SHORT;
  
@@ -118,7 +118,7 @@ Signed-off-by: Chad Monroe <chad@monroe.io>
  	return ETHTOOL_A_CABLE_RESULT_CODE_UNSPEC;
  }
  
-@@ -2510,6 +2552,155 @@ static int rtl826x_config_serdes_polarit
+@@ -2586,6 +2628,155 @@ static int rtl826x_config_serdes_polarit
  			      mask, set);
  }
  
@@ -274,7 +274,7 @@ Signed-off-by: Chad Monroe <chad@monroe.io>
  static int rtl826x_config_init(struct phy_device *phydev)
  {
  	const unsigned int max_dereset_tries = 5;
-@@ -2584,6 +2775,24 @@ static int rtl826x_get_features(struct p
+@@ -2660,6 +2851,24 @@ static int rtl826x_get_features(struct p
  	return 0;
  }
  
@@ -299,7 +299,7 @@ Signed-off-by: Chad Monroe <chad@monroe.io>
  static int rtl825xb_get_features(struct phy_device *phydev)
  {
  	int ret;
-@@ -2757,6 +2966,86 @@ static irqreturn_t rtl826x_handle_interr
+@@ -2833,6 +3042,86 @@ static irqreturn_t rtl826x_handle_interr
  	return IRQ_HANDLED;
  }
  
@@ -386,7 +386,7 @@ Signed-off-by: Chad Monroe <chad@monroe.io>
  static int rtl826x_set_wol(struct phy_device *phydev, struct ethtool_wolinfo *wol)
  {
  	static const u32 cfg_reg[4] = {0xD8C6, 0xD8C8, 0xD8CA, 0xD8CC};
-@@ -3285,6 +3574,25 @@ static struct phy_driver realtek_drvs[]
+@@ -3369,6 +3658,25 @@ static struct phy_driver realtek_drvs[]
  		.get_tunable    = rtl826x_get_tunable,
  		.set_tunable    = rtl826x_set_tunable,
  	}, {

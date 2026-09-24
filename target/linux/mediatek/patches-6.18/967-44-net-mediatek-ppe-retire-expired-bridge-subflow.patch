@@ -14,7 +14,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/drivers/net/ethernet/mediatek/mtk_ppe.c
 +++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
-@@ -625,7 +625,7 @@
+@@ -625,7 +625,7 @@ mtk_flow_entry_update_l2(struct mtk_ppe
  		if (!mtk_flow_entry_update(ppe, cur, packets, bytes)) {
  			entry->prev_packets += cur->prev_packets;
  			entry->prev_bytes += cur->prev_bytes;
@@ -22,3 +22,4 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 +			__mtk_foe_entry_clear(ppe, cur, false);
  			continue;
  		}
+ 

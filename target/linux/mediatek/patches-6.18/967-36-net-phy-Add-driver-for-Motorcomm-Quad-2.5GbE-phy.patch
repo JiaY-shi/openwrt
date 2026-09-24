@@ -1771,7 +1771,7 @@ changes in v2:
   * @plca_cfg: output structure to store the PLCA configuration
 --- a/include/linux/phy.h
 +++ b/include/linux/phy.h
-@@ -2014,6 +2014,7 @@ int genphy_c45_loopback(struct phy_devic
+@@ -2031,6 +2031,7 @@ int genphy_c45_loopback(struct phy_devic
  int genphy_c45_pma_resume(struct phy_device *phydev);
  int genphy_c45_pma_suspend(struct phy_device *phydev);
  int genphy_c45_fast_retrain(struct phy_device *phydev, bool enable);

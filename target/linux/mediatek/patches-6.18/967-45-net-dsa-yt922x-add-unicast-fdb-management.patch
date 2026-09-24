@@ -29,7 +29,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  
  #include <net/dsa.h>
  #include <net/dscp.h>
-@@ -6301,6 +6302,184 @@
+@@ -6301,6 +6302,184 @@ static void yt922x_dsa_teardown(struct d
  #define YT922X_FDB_START		BIT(0)
  #define YT922X_AGEING_TIME	0x18043c
  
@@ -214,7 +214,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  /* Whale's indirect FDB engine is different from Tiger's. The command below
   * removes dynamic unicast entries learned on one physical port. In
   * particular, bit 7 (flush static entries) must remain clear.
-@@ -6598,6 +6777,9 @@
+@@ -6598,6 +6777,9 @@ static int yt922x_dsa_set_ageing_time(st
  
  static const struct dsa_switch_ops yt922x_dsa_switch_ops = {
  	.port_bridge_join	= yt922x_dsa_port_bridge_join,

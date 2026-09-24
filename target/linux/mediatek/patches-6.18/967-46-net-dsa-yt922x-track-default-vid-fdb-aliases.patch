@@ -21,7 +21,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/drivers/net/dsa/yt921x.c
 +++ b/drivers/net/dsa/yt921x.c
-@@ -6323,6 +6323,36 @@
+@@ -6323,6 +6323,36 @@ static void yt922x_dsa_teardown(struct d
  #define YT922X_FDB_PORT		GENMASK(15, 12)
  #define YT922X_BRIDGE_VID		1
  
@@ -58,7 +58,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  /* Caller holds reg_lock for the entire indirect-table transaction. */
  static int yt922x_fdb_op(struct yt921x_priv *priv, const u32 in[4],
  			 u32 command, u32 out[4], u32 *result)
-@@ -6365,7 +6395,8 @@
+@@ -6365,7 +6395,8 @@ static bool yt922x_fdb_bridge_supported(
  {
  	struct dsa_port *dp;
  
@@ -68,7 +68,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  		return false;
  	if (dsa_is_user_port(&priv->ds, port))
  		return priv->ports[port].yt922x_bridge == db.bridge.dev;
-@@ -6382,6 +6413,7 @@
+@@ -6382,6 +6413,7 @@ yt922x_dsa_port_fdb_add(struct dsa_switc
  			const unsigned char *addr, u16 vid, struct dsa_db db)
  {
  	struct yt921x_priv *priv = to_yt921x_priv(ds);
@@ -76,7 +76,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	u32 entry[4], result;
  	int ret;
  
-@@ -6397,11 +6429,40 @@
+@@ -6397,11 +6429,40 @@ yt922x_dsa_port_fdb_add(struct dsa_switc
  	} else if (!yt922x_fdb_bridge_supported(priv, port, vid, db)) {
  		ret = -EOPNOTSUPP;
  	} else {
@@ -117,7 +117,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	return ret;
  }
  
-@@ -6410,16 +6471,31 @@
+@@ -6410,16 +6471,31 @@ yt922x_dsa_port_fdb_del(struct dsa_switc
  			const unsigned char *addr, u16 vid, struct dsa_db db)
  {
  	struct yt921x_priv *priv = to_yt921x_priv(ds);
@@ -151,7 +151,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	/* A move can install the new destination before the old delete is
  	 * delivered. Never delete another port's entry or a learned entry.
  	 */
-@@ -6427,8 +6503,13 @@
+@@ -6427,8 +6503,13 @@ yt922x_dsa_port_fdb_del(struct dsa_switc
  	    (out[2] & (YT922X_FDB_IPMC | YT922X_FDB_LAG)) ||
  	    FIELD_GET(YT922X_FDB_STATUS, out[1]) != YT922X_FDB_STATIC ||
  	    FIELD_GET(YT922X_FDB_PORT, out[2]) != port)
@@ -166,7 +166,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  out:
  	mutex_unlock(&priv->reg_lock);
  	return ret;
-@@ -6874,6 +6955,7 @@
+@@ -6874,6 +6955,7 @@ static int yt921x_mdio_probe(struct mdio
  	struct yt921x_reg_mdio *mdio;
  	struct yt921x_priv *priv;
  	struct dsa_switch *ds;
@@ -174,7 +174,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  
  	compat_info = of_device_get_match_data(dev);
  	if (!compat_info)
-@@ -6892,6 +6974,10 @@
+@@ -6892,6 +6974,10 @@ static int yt921x_mdio_probe(struct mdio
  	mdio->switchid = 0;
  
  	mutex_init(&priv->reg_lock);
@@ -187,7 +187,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	priv->reg_ops = &yt921x_reg_ops_mdio;
 --- a/drivers/net/dsa/yt921x.h
 +++ b/drivers/net/dsa/yt921x.h
-@@ -1092,6 +1092,9 @@
+@@ -1092,6 +1092,9 @@ struct yt921x_priv {
  
  	u8 acl_masks[YT921X_ACL_BLK_NUM];
  	struct yt921x_acl_blk *acl_blks[YT921X_ACL_BLK_NUM];
