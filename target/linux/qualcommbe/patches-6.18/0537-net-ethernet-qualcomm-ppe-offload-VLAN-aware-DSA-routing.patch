@@ -1,0 +1,643 @@
+From: JiaY-shi <shi05275@163.com>
+Date: Sat, 10 Oct 2026 15:30:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: offload VLAN-aware DSA routing
+
+VLAN-aware vsc73xx-8021q bridges carry the customer VID directly on
+the conduit. Resolve the rule's VLAN or the access port's PVID instead
+of rejecting filtering ports or pushing an extra internal DSA tag.
+Validate bridge protocol, forwarding state and VLAN membership.
+
+Give each conduit/VID a referenced L3 interface for ingress routing
+and egress MAC rewriting, bind its router MAC before publishing either
+direction, and use the VLAN VSI rather than the shared port identity.
+Check the source L3 interface in hardware so an existing five-tuple
+cannot bypass policy when received from another VLAN.
+
+Drain installed flows on DSA bridge VLAN, PVID, filtering, STP, MAC and
+link changes. Serialize installation with these notifications using a
+non-blocking RTNL acquisition: teardown may flush the offload workqueue
+while holding RTNL, so waiting for it here would deadlock.
+
+Clear recycled VLAN L3 rows and verify shared slots retain compatible
+CPU tag handling. VLAN-unaware internal tags retain their original
+single-tag behavior; stacked customer and internal tags stay rejected.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
+@@ -51,6 +51,8 @@
+  * @nat_port: Translated source port of SNAT flows, translated
+  * destination port of DNAT flows.
+  * @pmtu: Path MTU of the egress device of the flow.
++ * @src_l3_if_valid: Require the ingress L3 interface to match.
++ * @src_l3_if: Expected ingress L3 interface.
+  */
+ struct ppe_flow_entry {
+ 	union {
+@@ -66,6 +68,8 @@
+ 	u16 host_index;
+ 	__be16 nat_port;
+ 	u16 pmtu;
++	bool src_l3_if_valid;
++	u8 src_l3_if;
+ };
+ 
+ int ppe_flow_hw_init(struct ppe_device *ppe_dev);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -577,6 +577,8 @@
+ #define PPE_L3_ROUTE_CTRL_IP_MTU_FAIL		GENMASK(4, 3)
+ #define PPE_L3_ROUTE_CTRL_IP_MTU_DEACCEL	BIT(5)
+ #define PPE_L3_ROUTE_CTRL_IP_MTU_DF_FAIL	GENMASK(7, 6)
++#define PPE_L3_ROUTE_CTRL_SRC_IF_FAIL		GENMASK(13, 12)
++#define PPE_L3_ROUTE_CTRL_SRC_IF_DEACCEL	BIT(14)
+ 
+ /* Host-table hash policy and route-mismatch handling. */
+ #define PPE_L3_ROUTE_CTRL_EXT_ADDR		0x200494
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -145,6 +145,9 @@
+ 	val[0] |= FIELD_PREP(PPE_FLOW_W0_PROTOCOL_TYPE, flow->proto);
+ 	val[0] |= FIELD_PREP(PPE_FLOW_W0_AGE, 3);
+ 	val[0] |= FIELD_PREP(PPE_FLOW_W0_FWD_TYPE, flow->fwd_type);
++	if (flow->src_l3_if_valid)
++		val[0] |= PPE_FLOW_W0_SRC_L3_IF_VALID |
++			  FIELD_PREP(PPE_FLOW_W0_SRC_L3_IF, flow->src_l3_if);
+ 	val[1] = FIELD_PREP(PPE_FLOW_W1_NEXT_HOP, flow->nexthop);
+ 	val[1] |= FIELD_PREP(PPE_FLOW_W1_L4_PORT,
+ 			     be16_to_cpu(flow->nat_port));
+@@ -703,7 +706,9 @@
+ 	       PPE_L3_ROUTE_CTRL_IP_MRU_DEACCEL |
+ 	       PPE_L3_ROUTE_CTRL_IP_MTU_FAIL |
+ 	       PPE_L3_ROUTE_CTRL_IP_MTU_DEACCEL |
+-	       PPE_L3_ROUTE_CTRL_IP_MTU_DF_FAIL;
++	       PPE_L3_ROUTE_CTRL_IP_MTU_DF_FAIL |
++	       PPE_L3_ROUTE_CTRL_SRC_IF_FAIL |
++	       PPE_L3_ROUTE_CTRL_SRC_IF_DEACCEL;
+ 	val = FIELD_PREP(PPE_L3_ROUTE_CTRL_IP_MRU_FAIL,
+ 			 PPE_ACTION_REDIRECT_TO_CPU) |
+ 	      PPE_L3_ROUTE_CTRL_IP_MRU_DEACCEL |
+@@ -711,6 +716,8 @@
+ 			 PPE_ACTION_REDIRECT_TO_CPU) |
+ 	      PPE_L3_ROUTE_CTRL_IP_MTU_DEACCEL |
+ 	      FIELD_PREP(PPE_L3_ROUTE_CTRL_IP_MTU_DF_FAIL,
++			 PPE_ACTION_REDIRECT_TO_CPU) |
++	      FIELD_PREP(PPE_L3_ROUTE_CTRL_SRC_IF_FAIL,
+ 			 PPE_ACTION_REDIRECT_TO_CPU);
+ 	ret = regmap_update_bits(ppe_dev->regmap, PPE_L3_ROUTE_CTRL_ADDR,
+ 				 mask, val);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -20,6 +20,7 @@
+ #include <linux/etherdevice.h>
+ #include <linux/hashtable.h>
+ #include <linux/if_arp.h>
++#include <linux/if_bridge.h>
+ #include <linux/if_vlan.h>
+ #include <linux/ip.h>
+ #include <linux/netdevice.h>
+@@ -37,6 +38,7 @@
+ #include <net/ipv6.h>
+ #include <net/lwtunnel.h>
+ #include <net/neighbour.h>
++#include <net/switchdev.h>
+ #include <net/tcp.h>
+ 
+ #include "edma_port.h"
+@@ -130,6 +132,7 @@
+  * @ref: Reference count of the uplink.
+  * @vid: VLAN ID of the uplink.
+  * @port: PPE port the tagged packets ingress on.
++ * @keep_tag: Preserve the VLAN on packets punted to the CPU.
+  * @poisoned: Cleanup failed and the slot must not be reused.
+  *
+  * A VLAN uplink owns one of the reserved top ingress translation
+@@ -143,6 +146,7 @@
+ 	struct ppe_ft_ref ref;
+ 	u16 vid;
+ 	u8 port;
++	bool keep_tag;
+ 	bool poisoned;
+ };
+ 
+@@ -160,9 +164,11 @@
+  * @pub_ip: Public IP slot held by the flow, negative when none.
+  * @pppoe: PPPoE session slot held by the flow, negative when none.
+  * @vlan: VLAN uplink slot held by the flow, negative when none.
++ * @egress_vlan: VLAN slot providing the egress L3 identity.
+  * @eport: Egress PPE port of the flow.
+  * @egress_dev: DSA user netdev held for carrier and topology checks.
+  * @egress_vid: tag_8021q VID programmed for DSA egress.
++ * @egress_vlan_aware: Egress uses a customer VID rather than a DSA tag.
+  * @packets: Hit packet count at the last stats read.
+  * @bytes: Hit byte count at the last stats read.
+  */
+@@ -179,6 +185,7 @@
+ 	int pub_ip;
+ 	int pppoe;
+ 	int vlan;
++	int egress_vlan;
+ 	int tunnel;
+ 	int vp;
+ 	int ivp;
+@@ -186,6 +193,7 @@
+ 	u8 eport;
+ 	struct net_device *egress_dev;
+ 	u16 egress_vid;
++	bool egress_vlan_aware;
+ 	u32 packets;
+ 	u64 bytes;
+ };
+@@ -310,6 +318,8 @@
+ 	struct ppe_ft_tunnel_underlay tunnel_underlays[PPE_FT_TUNNEL_UNDERLAYS];
+ 	struct ppe_ft_tunnel_pppoe_port tunnel_pppoe_ports[PPE_PORT_ID_COUNT];
+ 	struct notifier_block ppp_nb;
++	struct notifier_block dsa_netdev_nb;
++	struct notifier_block dsa_switchdev_nb;
+ 	struct list_head block_cb_list;
+ };
+ 
+@@ -337,6 +347,7 @@
+ 	int pppoe_sid;
+ 	int ingress_vid;
+ 	bool ingress_dsa;
++	bool ingress_vlan_aware;
+ 	int ingress_ifindex;
+ };
+ 
+@@ -959,7 +970,9 @@
+ static int ppe_ft_vlan_get(struct ppe_flowtable *ft, int port, u16 vid,
+ 			   int mtu, bool keep_tag)
+ {
+-	struct ppe_ft_vlan want = { .vid = vid, .port = port };
++	struct ppe_ft_vlan want = {
++		.vid = vid, .port = port, .keep_tag = keep_tag,
++	};
+ 	const u8 no_mac[ETH_ALEN] = {};
+ 	u32 eg_modes;
+ 	bool is_new;
+@@ -968,12 +981,22 @@
+ 	i = ppe_ft_ref_get(ft->vlans, sizeof(*ft->vlans),
+ 			   PPE_L3_VLAN_UPLINKS, ppe_ft_vlan_match,
+ 			   &want, &is_new);
+-	if (i < 0 || !is_new)
++	if (i < 0)
+ 		return i;
++	if (!is_new) {
++		if (ft->vlans[i].keep_tag != keep_tag) {
++			ppe_ft_ref_put(ft->vlans, sizeof(*ft->vlans), i);
++			return -EOPNOTSUPP;
++		}
++		return i;
++	}
+ 
+-	/* The L3 interface only terminates ingress, no next hop points
+-	 * at it: it carries no egress MAC.
++	/* Ingress and egress users publish their router MAC before their
++	 * flow. A reused slot must not retain another VLAN's MAC bitmap.
+ 	 */
++	ret = ppe_l3_if_clear(ft->ppe_dev, ppe_ft_vlan_l3_if(ft, i));
++	if (ret)
++		return ret;
+ 	ret = ppe_l3_if_set(ft->ppe_dev, ppe_ft_vlan_l3_if(ft, i),
+ 			    no_mac, mtu, -1);
+ 	if (ret)
+@@ -984,16 +1007,13 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	if (keep_tag) {
+-		eg_modes = 0;
++	eg_modes = 0;
++	if (keep_tag)
+ 		for (p = 0; p < ft->ppe_dev->num_ports; p++)
+ 			eg_modes |= PPE_EG_VLAN_MODE_UNMODIFIED << (p * 2);
+-
+-		ret = ppe_vsi_eg_mode_set(ft->ppe_dev, ppe_ft_vlan_vsi(i),
+-					  eg_modes);
+-		if (ret)
+-			return ret;
+-	}
++	ret = ppe_vsi_eg_mode_set(ft->ppe_dev, ppe_ft_vlan_vsi(i), eg_modes);
++	if (ret)
++		return ret;
+ 
+ 	ret = ppe_ing_xlt_rule_set(ft->ppe_dev, ppe_ft_vlan_xlt(i),
+ 				   BIT(port), vid, ppe_ft_vlan_vsi(i),
+@@ -1039,6 +1059,9 @@
+ 	err = ppe_fdb_vsi_flush(ft->ppe_dev, ppe_ft_vlan_vsi(index));
+ 	if (!ret)
+ 		ret = err;
++	err = ppe_l3_if_clear(ft->ppe_dev, ppe_ft_vlan_l3_if(ft, index));
++	if (!ret)
++		ret = err;
+ 	if (ret) {
+ 		slot->poisoned = true;
+ 		slot->ref.refcnt = 1;
+@@ -1805,9 +1828,11 @@
+ 	kfree(flow);
+ }
+ 
+-static int ppe_ft_dsa_port(struct net_device *dev, struct dsa_port **dpp)
++static int ppe_ft_dsa_port(struct net_device *dev, int vid,
++			   struct dsa_port **dpp)
+ {
+ 	struct dsa_port *dp;
++	int ret;
+ 
+ 	if (!dev || !dsa_user_dev_check(dev))
+ 		return -EOPNOTSUPP;
+@@ -1822,16 +1847,47 @@
+ 	if (!edma_port_dev_check(dsa_port_to_conduit(dp)))
+ 		return -EOPNOTSUPP;
+ 
+-	if (dsa_port_is_vlan_filtering(dp))
+-		return -EOPNOTSUPP;
++	if (dsa_port_is_vlan_filtering(dp)) {
++		struct net_device *br = dsa_port_bridge_dev_get(dp);
++		struct bridge_vlan_info info;
++		u16 proto, pvid;
++
++		/* This tagger carries a single customer tag to the conduit
++		 * in VLAN-aware mode. The switch applies the port's egress
++		 * tag/untag policy, including access-port PVID handling.
++		 */
++		rcu_read_lock();
++		ret = -EOPNOTSUPP;
++		if (!br || !br_vlan_enabled(br) ||
++		    br_vlan_get_proto(br, &proto) || proto != ETH_P_8021Q ||
++		    dp->stp_state != BR_STATE_FORWARDING)
++			goto out;
++		if (vid < 0) {
++			if (br_vlan_get_pvid_rcu(dev, &pvid))
++				goto out;
++			vid = pvid;
++		}
++		if (!vid || vid >= VLAN_VID_MASK || vid_is_dsa_8021q(vid) ||
++		    br_vlan_get_info_rcu(dev, vid, &info))
++			goto out;
++		ret = vid;
++out:
++		rcu_read_unlock();
++		if (ret < 0)
++			return ret;
++	} else {
++		/* A customer tag inside an internal DSA tag is QinQ. */
++		if (vid >= 0)
++			return -EOPNOTSUPP;
++		ret = dsa_port_bridge_dev_get(dp) ?
++			dsa_tag_8021q_bridge_vid(dsa_port_bridge_num_get(dp)) :
++			dsa_tag_8021q_standalone_vid(dp);
++	}
+ 
+ 	if (dpp)
+ 		*dpp = dp;
+ 
+-	if (dsa_port_bridge_dev_get(dp))
+-		return dsa_tag_8021q_bridge_vid(dsa_port_bridge_num_get(dp));
+-
+-	return dsa_tag_8021q_standalone_vid(dp);
++	return ret;
+ }
+ 
+ static int ppe_ft_flow_replace(struct ppe_flowtable *ft,
+@@ -1905,6 +1961,7 @@
+ 	flow->pub_ip = -1;
+ 	flow->pppoe = -1;
+ 	flow->vlan = -1;
++	flow->egress_vlan = -1;
+ 	flow->tunnel = -1;
+ 	flow->vp = -1;
+ 	flow->ivp = -1;
+@@ -2204,7 +2261,7 @@
+ 	}
+ 	reject_reason = PPE_FT_REJECT_OUTPUT_DEVICE;
+ 	if (!tunnel_encap && !edma_port_dev_check(odev) &&
+-	    ppe_ft_dsa_port(odev, NULL) < 0 &&
++	    ppe_ft_dsa_port(odev, nh.vid, NULL) < 0 &&
+ 	    (!ft->ppe_dev->variant->has_vports ||
+ 	     odev->type != ARPHRD_ETHER || !odev->ieee80211_ptr)) {
+ 		ret = -EOPNOTSUPP;
+@@ -2259,25 +2316,34 @@
+ 			struct edma_port_priv *ipriv;
+ 			int dsa_ivid;
+ 
+-			dsa_ivid = ppe_ft_dsa_port(idev, &dp);
++			dsa_ivid = ppe_ft_dsa_port(idev, data.ingress_vid, &dp);
+ 			if (dsa_ivid < 0) {
+ 				vp_ret = dsa_ivid;
+ 				goto put_idev;
+ 			}
+ 			conduit = dsa_port_to_conduit(dp);
+ 
+-			/* The parser exposes one VLAN layer. A user VLAN inside
+-			 * the tag_8021q tag cannot use this path.
+-			 */
+-			if (data.ingress_vid >= 0) {
+-				vp_ret = -EOPNOTSUPP;
+-				goto put_idev;
+-			}
+-
+ 			ipriv = netdev_priv(conduit);
+ 			iport = ipriv->ppe_port->port_id;
+ 			data.ingress_vid = dsa_ivid;
+ 			data.ingress_dsa = true;
++			data.ingress_vlan_aware = dsa_port_is_vlan_filtering(dp);
++			if (data.ingress_vlan_aware && master) {
++				struct net_device *vdev;
++				struct list_head *iter;
++
++				rcu_read_lock();
++				netdev_for_each_upper_dev_rcu(master, vdev, iter) {
++					if (!is_vlan_dev(vdev) ||
++					    vlan_dev_vlan_proto(vdev) != htons(ETH_P_8021Q) ||
++					    vlan_dev_vlan_id(vdev) != dsa_ivid)
++						continue;
++					ether_addr_copy(data.eth.ingress, vdev->dev_addr);
++					imtu = vdev->mtu;
++					break;
++				}
++				rcu_read_unlock();
++			}
+ 		} else if (ft->ppe_dev->variant->has_vports &&
+ 			   idev->type == ARPHRD_ETHER && idev->ieee80211_ptr) {
+ 			reject_reason = PPE_FT_REJECT_INGRESS_VP;
+@@ -2310,15 +2376,7 @@
+ 			struct dsa_port *dp;
+ 			int dsa_ovid;
+ 
+-			/* The next hop pushes one tag; a switch port
+-			 * with tagged bridge-vlan egress would need
+-			 * its 802.1Q tag inside the tag_8021q one.
+-			 */
+-			if (nh.vid >= 0) {
+-				ret = -EOPNOTSUPP;
+-				goto err_prelock_ivp;
+-			}
+-			dsa_ovid = ppe_ft_dsa_port(odev, &dp);
++			dsa_ovid = ppe_ft_dsa_port(odev, nh.vid, &dp);
+ 			if (dsa_ovid < 0) {
+ 				ret = dsa_ovid;
+ 				goto err_prelock_ivp;
+@@ -2329,6 +2387,7 @@
+ 			nh.vid = dsa_ovid;
+ 			flow->egress_dev = odev;
+ 			flow->egress_vid = dsa_ovid;
++			flow->egress_vlan_aware = dsa_port_is_vlan_filtering(dp);
+ 			dev_hold(flow->egress_dev);
+ 		} else {
+ 			ret = ppe_vp_get(ft->ppe_dev, odev,
+@@ -2367,9 +2426,7 @@
+ 					       flow->entry.sport,
+ 		};
+ 
+-		rtnl_lock();
+ 		ret = dev_ip6_tnl_flow_offload(tdev, &key, &tnl_info);
+-		rtnl_unlock();
+ 		if (ret || ipv6_addr_any(&tnl_info.local) ||
+ 		    ipv6_addr_any(&tnl_info.remote)) {
+ 			ret = -EOPNOTSUPP;
+@@ -2503,6 +2560,49 @@
+ 		}
+ 	}
+ 
++	if (data.ingress_dsa) {
++		int l3_if = data.ingress_vlan_aware ?
++			ppe_ft_vlan_l3_if(ft, flow->vlan) : iport;
++
++		flow->ingress_my_mac = ppe_ft_my_mac_get(ft, data.eth.ingress);
++		if (flow->ingress_my_mac < 0) {
++			ret = flow->ingress_my_mac;
++			goto err_vlan;
++		}
++		ret = ppe_l3_if_set(ft->ppe_dev, l3_if, data.eth.ingress,
++				    imtu, -1);
++		if (ret)
++			goto err_vlan;
++		ret = ppe_l3_if_my_mac_set(ft->ppe_dev, l3_if,
++					   flow->ingress_my_mac, true);
++		if (ret)
++			goto err_vlan;
++		/* Prefer the VLAN VSI's L3 identity to the shared conduit. */
++		ret = ppe_port_l3_if_set(ft->ppe_dev, iport,
++					 data.ingress_vlan_aware ? -1 : iport);
++		if (ret)
++			goto err_vlan;
++		flow->entry.src_l3_if_valid = true;
++		flow->entry.src_l3_if = l3_if;
++	} else if (flow->ivp >= 0 || iport >= 0) {
++		flow->entry.src_l3_if_valid = true;
++		flow->entry.src_l3_if = flow->ivp >= 0 ?
++			ppe_ft_vp_l3_if(ft, flow->ivp) : iport;
++	}
++
++	if (flow->egress_vlan_aware) {
++		flow->egress_vlan = ppe_ft_vlan_get(ft, nh.port, nh.vid,
++						    odev->mtu, true);
++		if (flow->egress_vlan < 0) {
++			ret = flow->egress_vlan;
++			goto err_vlan;
++		}
++		nh.l3_if = ppe_ft_vlan_l3_if(ft, flow->egress_vlan);
++		ret = ppe_port_l3_if_set(ft->ppe_dev, nh.port, -1);
++		if (ret)
++			goto err_vlan;
++	}
++
+ 	/* A PPPoE push routes the flow through the L3 interface of its
+ 	 * session, which encapsulates on egress; the session table
+ 	 * entry of the slot terminates the reverse direction, whose
+@@ -2559,7 +2659,7 @@
+ 		 * ingress resolves its L3 interface through the
+ 		 * session table instead.
+ 		 */
+-		if (data.pppoe_sid < 0) {
++		if (data.pppoe_sid < 0 && !flow->egress_vlan_aware) {
+ 			ret = ppe_port_l3_if_set(ft->ppe_dev, nh.port,
+ 						 nh.l3_if);
+ 			if (ret)
+@@ -2641,6 +2741,7 @@
+ err_pppoe:
+ 	ppe_ft_pppoe_put(ft, flow->pppoe);
+ err_vlan:
++	ppe_ft_vlan_put(ft, flow->egress_vlan);
+ 	ppe_ft_vlan_put(ft, flow->vlan);
+ err_ingress_my_mac:
+ 	ppe_ft_my_mac_put(ft, flow->ingress_my_mac);
+@@ -2696,6 +2797,7 @@
+ 		ppe_ft_my_mac_put(ft, flow->ingress_my_mac);
+ 		ppe_ft_pppoe_put(ft, flow->pppoe);
+ 		ppe_ft_vlan_put(ft, flow->vlan);
++		ppe_ft_vlan_put(ft, flow->egress_vlan);
+ 		ppe_ft_pub_ip_put(ft, flow->pub_ip);
+ 		ppe_ft_tunnel_put(ft, flow->tunnel);
+ 		ppe_vp_put(ft->ppe_dev, flow->vp);
+@@ -2746,6 +2848,92 @@
+ 	rhashtable_walk_exit(&iter);
+ }
+ 
++/* RTNL serializes this check with bridge membership and VLAN changes. */
++static bool ppe_ft_dsa_owns_dev(struct ppe_flowtable *ft,
++				struct net_device *dev)
++{
++	struct net_device *lower;
++	struct list_head *iter;
++
++	if (is_vlan_dev(dev))
++		dev = vlan_dev_real_dev(dev);
++	if (dsa_user_dev_check(dev)) {
++		struct net_device *conduit =
++			dsa_port_to_conduit(dsa_port_from_netdev(dev));
++		struct edma_port_priv *priv;
++
++		if (!edma_port_dev_check(conduit))
++			return false;
++		priv = netdev_priv(conduit);
++		return priv->ppe_port->ppe_dev == ft->ppe_dev;
++	}
++	if (!netif_is_bridge_master(dev))
++		return false;
++	/* DSA user ports are direct lower devices of their bridge. */
++	netdev_for_each_lower_dev(dev, lower, iter)
++		if (dsa_user_dev_check(lower) && ppe_ft_dsa_owns_dev(ft, lower))
++			return true;
++	return false;
++}
++
++static int ppe_ft_dsa_netdev_event(struct notifier_block *nb,
++				   unsigned long event, void *ptr)
++{
++	struct ppe_flowtable *ft = container_of(nb, struct ppe_flowtable,
++					      dsa_netdev_nb);
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++
++	switch (event) {
++	case NETDEV_DOWN:
++	case NETDEV_UNREGISTER:
++	case NETDEV_CHANGE:
++	case NETDEV_CHANGEADDR:
++	case NETDEV_CHANGEMTU:
++	case NETDEV_CHANGEUPPER:
++		if (ppe_ft_dsa_owns_dev(ft, dev))
++			ppe_ft_flow_drain(ft);
++		break;
++	}
++	return NOTIFY_DONE;
++}
++
++static int ppe_ft_dsa_switchdev_event(struct notifier_block *nb,
++				      unsigned long event, void *ptr)
++{
++	struct ppe_flowtable *ft = container_of(nb, struct ppe_flowtable,
++					      dsa_switchdev_nb);
++	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
++
++	if (!ppe_ft_dsa_owns_dev(ft, dev))
++		return NOTIFY_DONE;
++
++	switch (event) {
++	case SWITCHDEV_PORT_OBJ_ADD:
++	case SWITCHDEV_PORT_OBJ_DEL: {
++		struct switchdev_notifier_port_obj_info *info = ptr;
++
++		if (info->obj->id == SWITCHDEV_OBJ_ID_PORT_VLAN)
++			ppe_ft_flow_drain(ft);
++		break;
++	}
++	case SWITCHDEV_PORT_ATTR_SET: {
++		struct switchdev_notifier_port_attr_info *info = ptr;
++
++		switch (info->attr->id) {
++		case SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING:
++		case SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL:
++		case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
++			ppe_ft_flow_drain(ft);
++			break;
++		default:
++			break;
++		}
++		break;
++	}
++	}
++	return NOTIFY_DONE;
++}
++
+ static int ppe_ft_flow_stats(struct ppe_flowtable *ft,
+ 			     struct flow_cls_offload *f)
+ {
+@@ -2770,7 +2958,9 @@
+ 
+ 	if (flow->egress_dev &&
+ 	    (!netif_carrier_ok(flow->egress_dev) ||
+-	     ppe_ft_dsa_port(flow->egress_dev, NULL) != flow->egress_vid)) {
++	     ppe_ft_dsa_port(flow->egress_dev,
++			     flow->egress_vlan_aware ? flow->egress_vid : -1,
++			     NULL) != flow->egress_vid)) {
+ 		rcu_read_unlock();
+ 		return 0;
+ 	}
+@@ -3447,7 +3637,14 @@
+ 
+ 	switch (f->command) {
+ 	case FLOW_CLS_REPLACE:
++		/* Topology notifications run under RTNL. Never wait for it
++		 * here: flowtable teardown can flush this workqueue while
++		 * holding RTNL. A busy topology retries through software.
++		 */
++		if (!rtnl_trylock())
++			return -EAGAIN;
+ 		ret = ppe_ft_flow_replace(ft, f);
++		rtnl_unlock();
+ 		atomic_long_inc(&ft->replace_calls);
+ 		if (ret == -EOPNOTSUPP)
+ 			atomic_long_inc(&ft->replace_unsupported);
+@@ -3584,15 +3781,21 @@
+ 	}
+ 
+ 	hash_init(ft->hosts);
++	ft->dsa_netdev_nb.notifier_call = ppe_ft_dsa_netdev_event;
++	ret = register_netdevice_notifier(&ft->dsa_netdev_nb);
++	if (ret)
++		goto err_hash;
++	ft->dsa_switchdev_nb.notifier_call = ppe_ft_dsa_switchdev_event;
++	ret = register_switchdev_blocking_notifier(&ft->dsa_switchdev_nb);
++	if (ret)
++		goto err_netdev;
+ 	ft->ppp_nb.notifier_call = ppe_ft_ppp_event;
+ 	ppe_dev->flowtable = ft;
+ 
+ 	ret = ppp_register_channel_notifier(&ft->ppp_nb);
+ 	if (ret) {
+ 		ppe_dev->flowtable = NULL;
+-		rhashtable_destroy(&ft->flows);
+-		kfree(ft);
+-		return ret;
++		goto err_switchdev;
+ 	}
+ 
+ 	/* The notifier reports only future channel transitions; adopt the
+@@ -3609,6 +3812,14 @@
+ 	rtnl_unlock();
+ 
+ 	return 0;
++err_switchdev:
++	unregister_switchdev_blocking_notifier(&ft->dsa_switchdev_nb);
++err_netdev:
++	unregister_netdevice_notifier(&ft->dsa_netdev_nb);
++err_hash:
++	rhashtable_destroy(&ft->flows);
++	kfree(ft);
++	return ret;
+ }
+ 
+ static void ppe_ft_flow_free(void *ptr, void *arg)
+@@ -3635,6 +3846,8 @@
+ 		return;
+ 
+ 	WARN_ON(!list_empty(&ft->block_cb_list));
++	unregister_switchdev_blocking_notifier(&ft->dsa_switchdev_nb);
++	unregister_netdevice_notifier(&ft->dsa_netdev_nb);
+ 	ppp_unregister_channel_notifier(&ft->ppp_nb);
+ 	ppe_ft_flow_drain(ft);
+ 	mutex_lock(&ft->lock);

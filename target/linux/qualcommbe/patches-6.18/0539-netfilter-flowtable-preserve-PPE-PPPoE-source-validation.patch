@@ -1,0 +1,195 @@
+From: JiaY-shi <shi05275@163.com>
+Date: Sat, 10 Oct 2026 16:00:00 +0800
+Subject: [PATCH] netfilter: flowtable: provide PPPoE ingress identity to PPE
+
+PPE source-interface validation must compare PPPoE ingress against the
+session L3 interface rather than its underlying physical port. Without
+an ingress session key the added check punts otherwise valid PPPoE
+return traffic to the CPU.
+
+Publish an exact PPPoE session, protocol and ethertype match from the
+flowtable tuple. Resolve and retain the corresponding connected PPE
+session by SID, ingress port and VLAN; reject ambiguous identities.
+Bind its local MAC independently of the reverse flow, and release the
+session reference through the existing flow teardown and error paths.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -25,6 +25,7 @@
+ 	struct flow_dissector_key_basic			basic;
+ 	struct flow_dissector_key_vlan			vlan;
+ 	struct flow_dissector_key_vlan			cvlan;
++	struct flow_dissector_key_pppoe			pppoe;
+ 	union {
+ 		struct flow_dissector_key_ipv4_addrs	ipv4;
+ 		struct flow_dissector_key_ipv6_addrs	ipv6;
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -4,6 +4,7 @@
+ #include <linux/netfilter.h>
+ #include <linux/rhashtable.h>
+ #include <linux/netdevice.h>
++#include <linux/ppp_defs.h>
+ #include <linux/tc_act/tc_csum.h>
+ #include <net/flow_offload.h>
+ #include <net/netfilter/nf_flow_table.h>
+@@ -97,6 +98,7 @@
+ 	struct nf_flow_key *key = &match->key;
+ 	struct ip_tunnel_info *tun_info;
+ 	bool vlan_encap = false;
++	int i;
+ 
+ 	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_META, meta);
+ 	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_CONTROL, control);
+@@ -173,6 +175,20 @@
+ 	match->dissector.used_keys |= BIT_ULL(key->control.addr_type);
+ 	mask->basic.n_proto = 0xffff;
+ 
++	for (i = 0; i < tuple->encap_num; i++) {
++		if (tuple->encap[i].proto != htons(ETH_P_PPP_SES))
++			continue;
++		NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_PPPOE, pppoe);
++		key->pppoe.session_id = htons(tuple->encap[i].id);
++		key->pppoe.ppp_proto = htons(tuple->l3proto == AF_INET ?
++					   PPP_IP : PPP_IPV6);
++		key->pppoe.type = htons(ETH_P_PPP_SES);
++		mask->pppoe.session_id = htons(0xffff);
++		mask->pppoe.ppp_proto = htons(0xffff);
++		mask->pppoe.type = htons(0xffff);
++		match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_PPPOE);
++	}
++
+ 	switch (tuple->l4proto) {
+ 	case IPPROTO_TCP:
+ 		key->tcp.flags = 0;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -24,6 +24,7 @@
+ #include <linux/if_vlan.h>
+ #include <linux/ip.h>
+ #include <linux/netdevice.h>
++#include <linux/ppp_defs.h>
+ #include <linux/ppp_channel.h>
+ #include <linux/rcupdate.h>
+ #include <linux/regmap.h>
+@@ -345,6 +346,7 @@
+ 	__be16 sport;
+ 	__be16 dport;
+ 	int pppoe_sid;
++	int ingress_pppoe_sid;
+ 	int ingress_vid;
+ 	bool ingress_dsa;
+ 	bool ingress_vlan_aware;
+@@ -711,6 +713,33 @@
+ 	return -ENOENT;
+ }
+ 
++/* The ingress rule carries the SID and physical/VLAN topology, but no
++ * Ethernet source match. Refuse ambiguous session identities.
++ */
++static int ppe_ft_pppoe_ingress_get(struct ppe_flowtable *ft, u16 sid,
++				    int port, int vid)
++{
++	int found = -ENOENT;
++	int i;
++
++	for (i = 0; i < PPE_FT_PPPOE_SESSIONS; i++) {
++		struct ppe_ft_pppoe *session = &ft->pppoe[i];
++
++		if (!session->ref.refcnt || !session->connected ||
++		    session->poisoned || session->sid != sid ||
++		    session->port != port ||
++		    (session->vlan < 0) != (vid < 0) ||
++		    (vid >= 0 && ft->vlans[session->vlan].vid != vid))
++			continue;
++		if (found >= 0)
++			return -EEXIST;
++		found = i;
++	}
++	if (found >= 0)
++		ft->pppoe[found].ref.refcnt++;
++	return found;
++}
++
+ static int ppe_ft_pppoe_dev_get(struct ppe_flowtable *ft,
+ 				struct net_device *ppp_dev, u16 sid,
+ 				const u8 *peer, int port, int vid)
+@@ -1948,6 +1977,7 @@
+ 	      BIT_ULL(FLOW_DISSECTOR_KEY_TCP) |
+ 	      BIT_ULL(FLOW_DISSECTOR_KEY_PORTS) |
+ 	      BIT_ULL(FLOW_DISSECTOR_KEY_VLAN) |
++	      BIT_ULL(FLOW_DISSECTOR_KEY_PPPOE) |
+ 	      PPE_FT_TUNNEL_KEYS))
+ 		return -EOPNOTSUPP;
+ 
+@@ -1967,6 +1997,7 @@
+ 	flow->ivp = -1;
+ 	nh.vid = -1;
+ 	data.pppoe_sid = -1;
++	data.ingress_pppoe_sid = -1;
+ 	data.ingress_vid = -1;
+ 	data.ingress_dsa = false;
+ 
+@@ -2052,6 +2083,22 @@
+ 		flow->entry.dport = match.key->dst;
+ 	}
+ 
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE)) {
++		struct flow_match_pppoe match;
++		u16 proto = flow->entry.is_ipv6 ? PPP_IPV6 : PPP_IP;
++
++		flow_rule_match_pppoe(rule, &match);
++		if (match.mask->session_id != htons(0xffff) ||
++		    match.mask->ppp_proto != htons(0xffff) ||
++		    match.mask->type != htons(0xffff) ||
++		    match.key->ppp_proto != htons(proto) ||
++		    match.key->type != htons(ETH_P_PPP_SES)) {
++			ret = -EOPNOTSUPP;
++			goto err_free;
++		}
++		data.ingress_pppoe_sid = ntohs(match.key->session_id);
++	}
++
+ 	/* A VLAN key means the flow ingresses tagged: the ingress port
+ 	 * needs a VLAN uplink slot, resolved from the META key below.
+ 	 */
+@@ -2603,6 +2650,37 @@
+ 			goto err_vlan;
+ 	}
+ 
++	if (data.ingress_pppoe_sid >= 0) {
++		struct ppe_ft_pppoe *session;
++		int l3_if;
++
++		reject_reason = PPE_FT_REJECT_PPPOE;
++		if (iport < 0 || data.ingress_dsa || flow->ivp >= 0 ||
++		    data.pppoe_sid >= 0) {
++			ret = -EOPNOTSUPP;
++			goto err_vlan;
++		}
++		flow->pppoe = ppe_ft_pppoe_ingress_get(ft, data.ingress_pppoe_sid,
++						   iport, data.ingress_vid);
++		if (flow->pppoe < 0) {
++			ret = flow->pppoe;
++			goto err_vlan;
++		}
++		session = &ft->pppoe[flow->pppoe];
++		l3_if = ppe_ft_pppoe_l3_if(ft, flow->pppoe);
++		flow->ingress_my_mac = ppe_ft_my_mac_get(ft, session->local);
++		if (flow->ingress_my_mac < 0) {
++			ret = flow->ingress_my_mac;
++			goto err_pppoe;
++		}
++		ret = ppe_l3_if_my_mac_set(ft->ppe_dev, l3_if,
++					   flow->ingress_my_mac, true);
++		if (ret)
++			goto err_pppoe;
++		flow->entry.src_l3_if_valid = true;
++		flow->entry.src_l3_if = l3_if;
++	}
++
+ 	/* A PPPoE push routes the flow through the L3 interface of its
+ 	 * session, which encapsulates on egress; the session table
+ 	 * entry of the slot terminates the reverse direction, whose

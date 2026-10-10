@@ -1,0 +1,42 @@
+From: JiaY-shi <shi05275@163.com>
+Date: Sat, 10 Oct 2026 15:49:00 +0800
+Subject: [PATCH] netfilter: flowtable: advertise populated VLAN match keys
+
+The flowtable fills VLAN matches without publishing their used_keys
+bits. Drivers using flow_rule_match_key() cannot see the VID, and PPE
+rejects tagged ingress rules containing a VLAN pop action.
+
+Publish the VLAN and CVLAN keys at each location where they are filled.
+This follows the fix proposed by Julius Bairaktaris on netfilter-devel.
+
+Fixes: 3e1b0c168f6c ("netfilter: flowtable: add vlan match offload support")
+Link: https://lore.kernel.org/netfilter-devel/20260913104251.648421-3-julius@bairaktaris.de/
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -124,6 +124,7 @@ static int nf_flow_rule_match(struct nf_flow_match *match,
+ 		nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+ 					tuple->encap[0].id,
+ 					tuple->encap[0].proto);
++		match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_VLAN);
+ 		vlan_encap = true;
+ 	}
+ 
+@@ -135,12 +136,16 @@ static int nf_flow_rule_match(struct nf_flow_match *match,
+ 			nf_flow_rule_vlan_match(&key->cvlan, &mask->cvlan,
+ 						tuple->encap[1].id,
+ 						tuple->encap[1].proto);
++			match->dissector.used_keys |=
++				BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN);
+ 		} else {
+ 			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_VLAN,
+ 					  vlan);
+ 			nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+ 						tuple->encap[1].id,
+ 						tuple->encap[1].proto);
++			match->dissector.used_keys |=
++				BIT_ULL(FLOW_DISSECTOR_KEY_VLAN);
+ 		}
+ 	}
+ 
