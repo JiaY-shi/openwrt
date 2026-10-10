@@ -1,0 +1,166 @@
+From: JiaY-shi <shi05275@163.com>
+Date: Sat, 10 Oct 2026 15:00:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: write complete L3 MAC binding rows
+
+The IN_L3_IF table is accessed as complete rows. Updating only word one
+with regmap_update_bits() does not reliably select and commit the MAC
+bitmap. DSA ingress to the bridge MAC consequently follows the L2 punt
+and Linux software flowtable path, even though valid hardware flows have
+increasing counters when EDMA transmits the packets back to the PPE.
+
+Read and write the complete ingress L3 row when adding or removing a
+MY_MAC binding, including invalidation before a MY_MAC slot is recycled.
+Serialize these read-modify-write transactions against interface setup
+and teardown so that concurrent MAC and MTU updates cannot lose fields.
+
+On GL-BE6500/IPQ5332, writing the bridge MY_MAC binding as a complete row
+restores LAN-to-WAN throughput from about 1.52 to 2.35 Gbit/s and reduces
+CPU0 from sustained 100% softirq to below 1% average utilization. EDMA
+software receive bytes stop tracking the bulk data flow.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.h
+@@ -74,6 +74,7 @@
+  * @fdb_lock: Lock to serialize the hardware FDB operation registers.
+  * @fdb_cmd_id: Rolling command ID of the last issued FDB operation.
+  * @flow_lock: Lock to serialize the L3 flow operation registers.
++ * @l3_if_lock: Lock serializing complete L3 interface row updates.
+  * @flow_cmd_id: Rolling command ID of the last issued flow operation.
+  * @tunnel_lock: Lock serializing tunnel operands, commands and tables.
+  * @num_icc_paths: Number of interconnect paths.
+@@ -99,6 +100,7 @@
+ 	u8 fdb_cmd_id;
+ 	/* Serialize the L3 flow operation registers. */
+ 	struct mutex flow_lock;
++	struct mutex l3_if_lock;
+ 	u8 flow_cmd_id;
+ 	/* Serialize the APPE tunnel command and table registers. */
+ 	struct mutex tunnel_lock;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -323,14 +323,12 @@
+ 		   bool valid)
+ {
+ 	u32 reg = PPE_MY_MAC_TBL_ADDR + PPE_MY_MAC_TBL_INC * index;
+-	u32 my_mac_mask;
+ 	u32 val[2] = {};
+ 	int i, ret;
+ 
+ 	if (index < 0 || index >= PPE_MY_MAC_TBL_ENTRIES)
+ 		return -EINVAL;
+ 
+-	my_mac_mask = FIELD_PREP(PPE_IN_L3_IF_W1_MAC_BITMAP, BIT(index));
+ 	if (valid) {
+ 		val[0] = (u32)addr[2] << 24 | addr[3] << 16 |
+ 			 addr[4] << 8 | addr[5];
+@@ -342,10 +340,7 @@
+ 		 * interface which used its previous address.
+ 		 */
+ 		for (i = 0; i < PPE_IN_L3_IF_TBL_ENTRIES; i++) {
+-			reg = PPE_IN_L3_IF_TBL_ADDR +
+-			      PPE_IN_L3_IF_TBL_INC * i + sizeof(u32);
+-			ret = regmap_update_bits(ppe_dev->regmap, reg,
+-						 my_mac_mask, 0);
++			ret = ppe_l3_if_my_mac_set(ppe_dev, i, index, false);
+ 			if (ret)
+ 				return ret;
+ 		}
+@@ -381,10 +376,11 @@
+ 	u32 reg;
+ 	int ret;
+ 
++	mutex_lock(&ppe_dev->l3_if_lock);
+ 	reg = PPE_IN_L3_IF_TBL_ADDR + PPE_IN_L3_IF_TBL_INC * index;
+ 	ret = regmap_bulk_read(ppe_dev->regmap, reg, in, ARRAY_SIZE(in));
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	in[0] &= ~(PPE_IN_L3_IF_W0_MRU | PPE_IN_L3_IF_W0_MTU |
+ 		   PPE_IN_L3_IF_W0_TTL_DEC_BYPASS |
+@@ -415,7 +411,7 @@
+ 
+ 	ret = regmap_bulk_write(ppe_dev->regmap, reg, in, ARRAY_SIZE(in));
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	eg[0] = (u32)addr[2] << 24 | addr[3] << 16 | addr[4] << 8 | addr[5];
+ 	eg[1] = FIELD_PREP(PPE_EG_L3_IF_W1_MAC_ADDR_HI,
+@@ -428,22 +424,40 @@
+ 
+ 	reg = PPE_EG_L3_IF_TBL_ADDR + PPE_EG_L3_IF_TBL_INC * index;
+ 
+-	return regmap_bulk_write(ppe_dev->regmap, reg, eg, ARRAY_SIZE(eg));
++	ret = regmap_bulk_write(ppe_dev->regmap, reg, eg, ARRAY_SIZE(eg));
++out:
++	mutex_unlock(&ppe_dev->l3_if_lock);
++	return ret;
+ }
+ 
+ int ppe_l3_if_my_mac_set(struct ppe_device *ppe_dev, int index, int my_mac,
+ 			 bool enable)
+ {
+-	u32 reg = PPE_IN_L3_IF_TBL_ADDR + PPE_IN_L3_IF_TBL_INC * index +
+-		  sizeof(u32);
++	u32 reg = PPE_IN_L3_IF_TBL_ADDR + PPE_IN_L3_IF_TBL_INC * index;
++	u32 row[3];
+ 	u32 mask;
++	int ret;
+ 
+-	if (my_mac < 0 || my_mac >= PPE_MY_MAC_TBL_ENTRIES)
++	if (index < 0 || index >= PPE_IN_L3_IF_TBL_ENTRIES ||
++	    my_mac < 0 || my_mac >= PPE_MY_MAC_TBL_ENTRIES)
+ 		return -EINVAL;
+ 
+ 	mask = FIELD_PREP(PPE_IN_L3_IF_W1_MAC_BITMAP, BIT(my_mac));
+-	return regmap_update_bits(ppe_dev->regmap, reg, mask,
+-				  enable ? mask : 0);
++	/* Reading word zero selects the row; partial word-one accesses do
++	 * not reliably read or commit the interface's MAC bitmap.
++	 */
++	mutex_lock(&ppe_dev->l3_if_lock);
++	ret = regmap_bulk_read(ppe_dev->regmap, reg, row, ARRAY_SIZE(row));
++	if (ret)
++		goto out;
++	if ((row[1] & mask) == (enable ? mask : 0))
++		goto out;
++	row[1] &= ~mask;
++	row[1] |= enable ? mask : 0;
++	ret = regmap_bulk_write(ppe_dev->regmap, reg, row, ARRAY_SIZE(row));
++out:
++	mutex_unlock(&ppe_dev->l3_if_lock);
++	return ret;
+ }
+ 
+ int ppe_l3_if_clear(struct ppe_device *ppe_dev, int index)
+@@ -452,13 +466,17 @@
+ 	u32 reg;
+ 	int ret;
+ 
++	mutex_lock(&ppe_dev->l3_if_lock);
+ 	reg = PPE_IN_L3_IF_TBL_ADDR + PPE_IN_L3_IF_TBL_INC * index;
+ 	ret = regmap_bulk_write(ppe_dev->regmap, reg, val, ARRAY_SIZE(val));
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	reg = PPE_EG_L3_IF_TBL_ADDR + PPE_EG_L3_IF_TBL_INC * index;
+-	return regmap_bulk_write(ppe_dev->regmap, reg, val, ARRAY_SIZE(val));
++	ret = regmap_bulk_write(ppe_dev->regmap, reg, val, ARRAY_SIZE(val));
++out:
++	mutex_unlock(&ppe_dev->l3_if_lock);
++	return ret;
+ }
+ 
+ /**
+@@ -662,6 +680,7 @@
+ 	int type, ret;
+ 
+ 	mutex_init(&ppe_dev->flow_lock);
++	mutex_init(&ppe_dev->l3_if_lock);
+ 
+ 	/* The result register resets to command id 0, so start the rolling
+ 	 * id at 1: otherwise the first operation's completion poll matches
