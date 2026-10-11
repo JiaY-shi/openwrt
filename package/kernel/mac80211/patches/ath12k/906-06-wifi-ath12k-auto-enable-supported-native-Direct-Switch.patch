@@ -1,0 +1,54 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] wifi: ath12k: automatically enable supported native Direct Switch
+
+Remove the experimental ppe_ds runtime switch. When the native transport
+is built and its supported IPQ5332 provider is available, register the
+QCN9274 shared rings and enable authorized AP peers automatically.
+
+Check transport availability before allocating WLAN rings or selecting
+bidirectional partner DMA mappings. Platforms without a supported provider
+keep ordinary forwarding. Peer authorization, fault isolation and DMA
+quiescence checks are unchanged.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/Kconfig
++++ b/drivers/net/wireless/ath/ath12k/Kconfig
+@@ -73,5 +73,5 @@ config ATH12K_PPE_DS_SUPPORT
+ 	depends on ATH12K
+ 	help
+ 	  Build the native PPE shared-ring client on Qualcomm platforms.
+ 	  Requires the matching qcom-ppe Direct Switch API in the kernel.
+-	  Runtime activation is controlled by the ppe_ds module parameter.
++	  Automatically activate on platforms with a supported transport.
+--- a/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
+@@ -31,10 +31,5 @@
+ #define ATH12K_DS_VP_TABLE 0x00a44194
+ 
+-/* Registration rejects unsupported PPE/DMA topologies before activation. */
+-static bool ppe_ds;
+-module_param(ppe_ds, bool, 0444);
+-MODULE_PARM_DESC(ppe_ds, "Enable native PPE Direct Switch (experimental)");
+-
+ struct ath12k_ds_buffer {
+ 	struct list_head list;
+ 	struct ath12k_tx_desc_info *desc;
+@@ -773,7 +768,7 @@
+ 	int port, ret = 0;
+ 	u8 link;
+ 
+-	if (arvif->ahvif->vif->type != NL80211_IFTYPE_AP || !ppe_ds)
++	if (arvif->ahvif->vif->type != NL80211_IFTYPE_AP)
+ 		return 0;
+ 	link = ahsta->primary_link_id;
+ 	if (link >= IEEE80211_MLD_MAX_NUM_LINKS || !(links & BIT(link)))
+@@ -1017,7 +1012,7 @@
+ 	struct ath12k_ds *ds;
+ 	int ret, i;
+ 
+-	if (!ppe_ds)
++	if (!qcom_ppe_ds_available())
+ 		return 0;
+ 	if (dp->ab->hw_rev == ATH12K_HW_QCN9274_HW10 ||
+ 	    dp->ab->hw_rev == ATH12K_HW_QCN9274_HW20 ||
