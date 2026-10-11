@@ -1,0 +1,122 @@
+From: JiaY-shi <shi05275@163.com>
+Date: Sat, 10 Oct 2026 17:10:00 +0800
+Subject: [PATCH] net: dsa: preserve service and customer VLAN tags
+
+Let vsc73xx-8021q honor the TPID registered by the switch. An 802.1ad
+DSA tag remains separate from the customer's 802.1Q tag, including
+VLAN-aware bridge transmissions. Other users retain their 802.1Q TPID.
+
+On receive, select a designated port by both the bridge identity and
+the inner customer VID, so a VLAN present only on a later bridge port
+is not assigned to the first port outside its membership.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/net/dsa/tag_8021q.c
++++ b/net/dsa/tag_8021q.c
+@@ -77,6 +77,12 @@
+ 	__be16 proto;
+ };
+ 
++__be16 dsa_tag_8021q_proto(struct dsa_switch *ds)
++{
++	return ds->tag_8021q_ctx ? ds->tag_8021q_ctx->proto : htons(ETH_P_8021Q);
++}
++EXPORT_SYMBOL_GPL(dsa_tag_8021q_proto);
++
+ u16 dsa_tag_8021q_bridge_vid(unsigned int bridge_num)
+ {
+ 	/* The VBID value of 0 is reserved for precise TX, but it is also
+@@ -472,7 +478,7 @@
+ EXPORT_SYMBOL_GPL(dsa_8021q_xmit);
+ 
+ static struct net_device *
+-dsa_tag_8021q_find_port_by_vbid(struct net_device *conduit, int vbid)
++dsa_tag_8021q_find_port_by_vbid(struct net_device *conduit, int vbid, int vid)
+ {
+ 	struct dsa_port *cpu_dp = conduit->dsa_ptr;
+ 	struct dsa_switch_tree *dst = cpu_dp->dst;
+@@ -492,8 +498,15 @@
+ 		if (dp->cpu_dp != cpu_dp)
+ 			continue;
+ 
+-		if (dsa_port_bridge_num_get(dp) == vbid)
+-			return dp->user;
++		if (dsa_port_bridge_num_get(dp) != vbid)
++			continue;
++		if (vid >= 0 && dsa_port_is_vlan_filtering(dp)) {
++			struct bridge_vlan_info info;
++
++			if (br_vlan_get_info_rcu(dp->user, vid, &info))
++				continue;
++		}
++		return dp->user;
+ 	}
+ 
+ 	return NULL;
+@@ -507,7 +520,7 @@
+ 	if (source_port != -1 && switch_id != -1)
+ 		return dsa_conduit_find_user(conduit, switch_id, source_port);
+ 	else if (vbid >= 1)
+-		return dsa_tag_8021q_find_port_by_vbid(conduit, vbid);
++		return dsa_tag_8021q_find_port_by_vbid(conduit, vbid, vid);
+ 
+ 	return dsa_find_designated_bridge_port_by_vid(conduit, vid);
+ }
+--- a/net/dsa/tag_vsc73xx_8021q.c
++++ b/net/dsa/tag_vsc73xx_8021q.c
+@@ -14,13 +14,14 @@
+ 	struct dsa_port *dp = dsa_user_to_port(netdev);
+ 	u16 queue_mapping = skb_get_queue_mapping(skb);
+ 	u16 tx_vid = dsa_tag_8021q_standalone_vid(dp);
++	u16 tpid = ntohs(dsa_tag_8021q_proto(dp->ds));
+ 	u8 pcp;
+ 
+ 	if (skb->offload_fwd_mark) {
+ 		unsigned int bridge_num = dsa_port_bridge_num_get(dp);
+ 		struct net_device *br = dsa_port_bridge_dev_get(dp);
+ 
+-		if (br_vlan_enabled(br))
++		if (br_vlan_enabled(br) && tpid == ETH_P_8021Q)
+ 			return skb;
+ 
+ 		tx_vid = dsa_tag_8021q_bridge_vid(bridge_num);
+@@ -28,7 +29,7 @@
+ 
+ 	pcp = netdev_txq_to_tc(netdev, queue_mapping);
+ 
+-	return dsa_8021q_xmit(skb, netdev, ETH_P_8021Q,
++	return dsa_8021q_xmit(skb, netdev, tpid,
+ 			      ((pcp << VLAN_PRIO_SHIFT) | tx_vid));
+ }
+ 
+@@ -39,6 +40,18 @@
+ 
+ 	dsa_8021q_rcv(skb, &src_port, &switch_id, &vbid, &vid);
+ 
++	/* An internal S-tag identifies the bridge; its inner C-tag must
++	 * select a member of that customer VLAN within the same bridge.
++	 */
++	if (vbid >= 1 && skb->protocol == htons(ETH_P_8021Q)) {
++		struct vlan_hdr *hdr;
++
++		if (!pskb_may_pull(skb, VLAN_HLEN))
++			return NULL;
++		hdr = (struct vlan_hdr *)skb->data;
++		vid = ntohs(hdr->h_vlan_TCI) & VLAN_VID_MASK;
++	}
++
+ 	skb->dev = dsa_tag_8021q_find_user(netdev, src_port, switch_id,
+ 					   vid, vbid);
+ 	if (!skb->dev) {
+--- a/include/linux/dsa/8021q.h
++++ b/include/linux/dsa/8021q.h
+@@ -15,6 +15,8 @@
+ 
+ int dsa_tag_8021q_register(struct dsa_switch *ds, __be16 proto);
+ 
++__be16 dsa_tag_8021q_proto(struct dsa_switch *ds);
++
+ void dsa_tag_8021q_unregister(struct dsa_switch *ds);
+ 
+ int dsa_tag_8021q_bridge_join(struct dsa_switch *ds, int port,
