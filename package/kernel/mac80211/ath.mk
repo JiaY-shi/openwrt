@@ -72,6 +72,7 @@ config-$(call config_package,ath12k) += ATH12K
 ifdef CONFIG_PACKAGE_kmod-ath12k
   config-y += ATH12K_AHB
   config-$(CONFIG_TARGET_qualcommbe) += ATH12K_COREDUMP
+  config-$(CONFIG_TARGET_qualcommbe) += ATH12K_PPE_DS_SUPPORT
 endif
 
 config-$(call config_package,ath5k) += ATH5K ATH5K_PCI
