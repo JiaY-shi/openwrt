@@ -1,0 +1,315 @@
+From: JiaY-shi <shi05275@163.com>
+Date: Sat, 10 Oct 2026 21:20:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: share identical next hops
+
+Every flow currently allocates a private next hop, even when hundreds
+of flows use the same gateway or wireless station. IPQ5332 has only
+768 next-hop rows; a multi-connection download fills this table long
+before exhausting the 2048 flow entries and repeatedly fails offload.
+
+Cache immutable next hops by all hardware rewrite fields: egress port,
+L3 interface, destination MAC, both VLAN tags, public NAT index and
+DNAT address. Compare the fields explicitly to avoid struct padding.
+Acquire a reference before publishing each flow and release it only
+after confirmed hardware deletion or pre-publication rollback.
+Quarantined flows retain their references and cannot lose their row
+when another sharing flow is removed. Purge remaining cache objects
+at driver teardown. Report occupied rows and references in debugfs.
+
+The per-flow NAT port, MTU, source-interface check, PPPoE/VLAN lifetime
+and packet counters remain independent. True resource exhaustion still
+fails open through the existing software path.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -23,6 +23,7 @@
+ #include <linux/if_bridge.h>
+ #include <linux/if_vlan.h>
+ #include <linux/ip.h>
++#include <linux/jhash.h>
+ #include <linux/netdevice.h>
+ #include <linux/ppp_defs.h>
+ #include <linux/ppp_channel.h>
+@@ -155,6 +156,16 @@
+ 
+ static_assert(offsetof(struct ppe_ft_vlan, ref) == 0);
+ 
++/* Flows own references to identical hardware rewrites, not private rows.
++ * Keep the configuration immutable until the last hardware flow is gone.
++ */
++struct ppe_ft_nexthop {
++	struct hlist_node node;
++	struct ppe_flow_nexthop config;
++	unsigned int refcnt;
++	u16 index;
++};
++
+ /**
+  * struct ppe_ft_flow - An offloaded flow.
+  * @node: Hash table node, keyed by the flow cookie.
+@@ -162,6 +173,7 @@
+  * @index: Hardware flow table index.
+  * @entry: The flow, kept for the delete command.
+  * @nexthop: Next hop index of the flow.
++ * @nexthop_ref: Shared next hop held until the hardware flow is deleted.
+  * @ingress_my_mac: Router MAC slot of an ingress virtual port.
+  * @my_mac: Router MAC slot held by the flow, negative when none.
+  * @pub_ip: Public IP slot held by the flow, negative when none.
+@@ -184,6 +196,7 @@
+ 	int index;
+ 	struct ppe_flow_entry entry;
+ 	u16 nexthop;
++	struct ppe_ft_nexthop *nexthop_ref;
+ 	int ingress_my_mac;
+ 	int my_mac;
+ 	int pub_ip;
+@@ -242,6 +255,7 @@
+ 				 PPE_FT_PPPOE_SESSIONS)
+ 
+ #define PPE_FT_HOST_HASH_BITS	8
++#define PPE_FT_NEXTHOP_HASH_BITS	8
+ 
+ enum ppe_ft_reject_reason {
+ 	PPE_FT_REJECT_PARSE,
+@@ -290,6 +304,7 @@
+  * @lock: Serializes rule installation, removal and the allocators.
+  * @flows: Offloaded flows, keyed by flow cookie.
+  * @nexthop_used: Allocation bitmap of the next hop entries.
++ * @nexthops: Next hop entries shared by identical hardware rewrites.
+  * @my_macs: Refcounted router MAC slots.
+  * @pub_ips: Refcounted public IP slots.
+  * @pppoe: Refcounted PPPoE session slots.
+@@ -315,6 +330,7 @@
+ 	atomic_long_t rejects[PPE_FT_REJECT_MAX];
+ 	DECLARE_HASHTABLE(hosts, PPE_FT_HOST_HASH_BITS);
+ 	DECLARE_BITMAP(nexthop_used, PPE_NEXTHOP_TBL_ENTRIES);
++	DECLARE_HASHTABLE(nexthops, PPE_FT_NEXTHOP_HASH_BITS);
+ 	struct ppe_ft_my_mac my_macs[PPE_MY_MAC_TBL_ENTRIES];
+ 	struct ppe_ft_pub_ip pub_ips[PPE_PUB_IP_TBL_ENTRIES];
+ 	struct ppe_ft_pppoe pppoe[PPE_FT_PPPOE_SESSIONS];
+@@ -1823,6 +1839,84 @@
+ 	memset(tunnel, 0, sizeof(*tunnel));
+ }
+ 
++static u32 ppe_ft_nexthop_key(const struct ppe_flow_nexthop *nh)
++{
++	u32 port = nh->port | nh->l3_if << 8 | nh->pub_ip_index << 16;
++	u32 tags = (u16)nh->vid | (u32)(u16)nh->svid << 16;
++	u32 mac = jhash(nh->mac, ETH_ALEN, 0);
++
++	return jhash_3words(port, tags, (__force u32)nh->dnat_ip, mac);
++}
++
++static bool ppe_ft_nexthop_match(const struct ppe_flow_nexthop *a,
++				 const struct ppe_flow_nexthop *b)
++{
++	/* Do not hash or compare structure padding. All hardware rewrite
++	 * fields participate, including both tags and the DNAT address.
++	 */
++	return a->port == b->port && a->l3_if == b->l3_if &&
++	       ether_addr_equal(a->mac, b->mac) && a->vid == b->vid &&
++	       a->svid == b->svid && a->pub_ip_index == b->pub_ip_index &&
++	       a->dnat_ip == b->dnat_ip;
++}
++
++/* Called under ft->lock. Acquire the reference before publishing a flow,
++ * and leave it held if deletion of that flow has to be quarantined.
++ */
++static struct ppe_ft_nexthop *
++ppe_ft_nexthop_get(struct ppe_flowtable *ft,
++		   const struct ppe_flow_nexthop *config)
++{
++	u32 key = ppe_ft_nexthop_key(config);
++	struct ppe_ft_nexthop *nh;
++	unsigned int index;
++	int ret;
++
++	lockdep_assert_held(&ft->lock);
++	hash_for_each_possible(ft->nexthops, nh, node, key) {
++		if (!ppe_ft_nexthop_match(&nh->config, config))
++			continue;
++		nh->refcnt++;
++		return nh;
++	}
++
++	index = find_first_zero_bit(ft->nexthop_used,
++				    ft->ppe_dev->variant->num_nexthop_entries);
++	if (index >= ft->ppe_dev->variant->num_nexthop_entries)
++		return ERR_PTR(-ENOSPC);
++	nh = kzalloc(sizeof(*nh), GFP_KERNEL);
++	if (!nh)
++		return ERR_PTR(-ENOMEM);
++
++	ret = ppe_nexthop_set(ft->ppe_dev, index, config);
++	if (ret) {
++		/* No flow can reference a row which was never published. */
++		kfree(nh);
++		return ERR_PTR(ret);
++	}
++	nh->config = *config;
++	nh->index = index;
++	nh->refcnt = 1;
++	set_bit(index, ft->nexthop_used);
++	hash_add(ft->nexthops, &nh->node, key);
++	return nh;
++}
++
++static void ppe_ft_nexthop_put(struct ppe_flowtable *ft,
++			       struct ppe_ft_nexthop *nh)
++{
++	lockdep_assert_held(&ft->lock);
++	if (!nh || --nh->refcnt)
++		return;
++
++	/* Only callers which proved their hardware flow gone drop its
++	 * reference. A quarantined flow continues to pin this exact row.
++	 */
++	hash_del(&nh->node);
++	clear_bit(nh->index, ft->nexthop_used);
++	kfree(nh);
++}
++
+ /* Hash key of a flow's source IP for the host refcount table. */
+ static u32 ppe_ft_host_key(const struct ppe_flow_entry *flow)
+ {
+@@ -2023,7 +2117,7 @@
+ 	struct in6_addr lwt_local = {}, lwt_remote = {};
+ 	u8 lwt_hop_limit = 0;
+ 	bool tunnel_flow, tunnel_encap = false, lwt_tunnel = false;
+-	int i, nexthop, ret, redirects = 0, vlan_pushes = 0;
++	int i, ret, redirects = 0, vlan_pushes = 0;
+ 	int pppoe_pushes = 0, csums = 0;
+ 	int iport = -1, imtu = 0;
+ 
+@@ -2857,23 +2951,19 @@
+ 			goto err_my_mac;
+ 	}
+ 
+-	nexthop = find_first_zero_bit(ft->nexthop_used,
+-				      ft->ppe_dev->variant->num_nexthop_entries);
+-	if (nexthop >= ft->ppe_dev->variant->num_nexthop_entries) {
+-		ret = -ENOSPC;
++	flow->nexthop_ref = ppe_ft_nexthop_get(ft, &nh);
++	if (IS_ERR(flow->nexthop_ref)) {
++		ret = PTR_ERR(flow->nexthop_ref);
++		flow->nexthop_ref = NULL;
+ 		goto err_my_mac;
+ 	}
+ 
+-	ret = ppe_nexthop_set(ft->ppe_dev, nexthop, &nh);
+-	if (ret)
+-		goto err_my_mac;
+-
+-	flow->nexthop = nexthop;
+-	flow->entry.nexthop = nexthop;
++	flow->nexthop = flow->nexthop_ref->index;
++	flow->entry.nexthop = flow->nexthop;
+ 
+ 	ret = ppe_ft_host_get(ft, &flow->entry);
+ 	if (ret)
+-		goto err_my_mac;
++		goto err_nexthop;
+ 
+ 	ret = ppe_flow_entry_add(ft->ppe_dev, &flow->entry);
+ 	if (ret < 0)
+@@ -2899,7 +2989,6 @@
+ 		}
+ 	}
+ 
+-	set_bit(nexthop, ft->nexthop_used);
+ 	mutex_unlock(&ft->lock);
+ 	if (tdev)
+ 		dev_put(tdev);
+@@ -2908,19 +2997,19 @@
+ 
+ err_hw_flow:
+ 	if (!ppe_ft_flow_hw_del(ft, flow)) {
+-		/* The hardware flow could not be removed and keeps forwarding
+-		 * through its next hop; reserve that next-hop index so it is not
+-		 * reused underneath the leaked flow.
++		/* Keep the shared next hop and all other dependencies pinned
++		 * until teardown, even if this flow could not be published.
+ 		 */
+-		set_bit(flow->nexthop, ft->nexthop_used);
+ 		ppe_ft_flow_quarantine(ft, flow);
+ 		flow = NULL;
+ 		goto err_unlock;
+ 	}
+ 	ppe_ft_host_put(ft, &flow->entry);
+-	goto err_my_mac;
++	goto err_nexthop;
+ err_host:
+ 	ppe_ft_host_put(ft, &flow->entry);
++err_nexthop:
++	ppe_ft_nexthop_put(ft, flow->nexthop_ref);
+ err_my_mac:
+ 	ppe_ft_my_mac_put(ft, flow->my_mac);
+ err_pppoe:
+@@ -2977,7 +3066,7 @@
+ 
+ 	if (ppe_ft_flow_hw_del(ft, flow)) {
+ 		ppe_ft_host_put(ft, &flow->entry);
+-		clear_bit(flow->nexthop, ft->nexthop_used);
++		ppe_ft_nexthop_put(ft, flow->nexthop_ref);
+ 		ppe_ft_my_mac_put(ft, flow->my_mac);
+ 		ppe_ft_my_mac_put(ft, flow->ingress_my_mac);
+ 		ppe_ft_pppoe_put(ft, flow->pppoe);
+@@ -3716,12 +3805,18 @@
+ 	struct ppe_flowtable *ft = seq->private;
+ 	struct rhashtable_iter iter;
+ 	struct ppe_ft_flow *flow;
++	struct ppe_ft_nexthop *nh;
+ 	struct list_head *pos;
+-	int i, zombies = 0;
++	unsigned int nh_used, nh_refs = 0;
++	int i, bucket, zombies = 0;
+ 
+ 	mutex_lock(&ft->lock);
+ 	list_for_each(pos, &ft->zombies)
+ 		zombies++;
++	nh_used = bitmap_weight(ft->nexthop_used,
++				ft->ppe_dev->variant->num_nexthop_entries);
++	hash_for_each(ft->nexthops, bucket, nh, node)
++		nh_refs += nh->refcnt;
+ 	mutex_unlock(&ft->lock);
+ 
+ 	seq_printf(seq,
+@@ -3736,6 +3831,9 @@
+ 		seq_printf(seq, " %s:%ld", ppe_ft_reject_names[i],
+ 			   atomic_long_read(&ft->rejects[i]));
+ 	seq_putc(seq, '\n');
++
++	seq_printf(seq, "nexthops used:%u capacity:%u references:%u\n",
++		   nh_used, ft->ppe_dev->variant->num_nexthop_entries, nh_refs);
+ 
+ 	rhashtable_walk_enter(&ft->flows, &iter);
+ 	rhashtable_walk_start(&iter);
+@@ -3966,6 +4064,7 @@
+ 	}
+ 
+ 	hash_init(ft->hosts);
++	hash_init(ft->nexthops);
+ 	ft->dsa_netdev_nb.notifier_call = ppe_ft_dsa_netdev_event;
+ 	ret = register_netdevice_notifier(&ft->dsa_netdev_nb);
+ 	if (ret)
+@@ -4024,6 +4123,7 @@
+ 	struct ppe_flowtable *ft = ppe_dev->flowtable;
+ 	struct ppe_ft_flow *flow, *flow_tmp;
+ 	struct ppe_ft_host *host;
++	struct ppe_ft_nexthop *nh;
+ 	struct hlist_node *tmp;
+ 	int i;
+ 
+@@ -4061,6 +4161,10 @@
+ 		hash_del(&host->node);
+ 		kfree(host);
+ 	}
++	hash_for_each_safe(ft->nexthops, i, tmp, nh, node) {
++		hash_del(&nh->node);
++		kfree(nh);
++	}
+ 
+ 	for (i = 0; i < PPE_FT_TUNNELS; i++)
+ 		if (ft->tunnels[i].dev)
