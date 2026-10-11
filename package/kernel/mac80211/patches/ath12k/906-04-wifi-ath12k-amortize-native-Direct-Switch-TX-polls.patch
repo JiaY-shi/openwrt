@@ -1,0 +1,63 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] wifi: ath12k: amortize native Direct Switch TX polls
+
+Native Direct Switch returns permanently mapped buffers to its pool, so
+normal TX completions need neither skb delivery nor DMA unmapping. Follow
+QSDK's PPE TX completion accounting: reap up to four completions per NAPI
+budget unit, retaining a bounded batch and charging its rounded-up cost
+to the shared NAPI. This amortizes ring locks, tail-pointer publication,
+RX refill retries and cross-engine index synchronization across a batch.
+
+Do not publish a WLAN completion tail pointer when the poll did not reap
+any entries. Preserve exception handling, all descriptor validation and
+the existing PPDU and monitor statistics configuration.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
+@@ -554,9 +554,15 @@ int ath12k_wifi7_ds_service(struct ath12k_dp *dp, int budget)
+ 	u32 cookie, info;
+ 	unsigned int completed = 0, acked = 0, dropped = 0;
+ 	int done = 0;
++	int quota;
+ 
+-	if (!ds || !ds->complete_ready || READ_ONCE(ds->stopped))
++	if (!ds || !ds->complete_ready || READ_ONCE(ds->stopped) || budget <= 0)
+ 		return 0;
++	/* QSDK charges four lightweight PPE completions per NAPI budget unit.
++	 * Bound each batch and round its cost up so a full batch requests
++	 * another poll instead of completing NAPI with work on the ring.
++	 */
++	quota = (budget << 2) - 1;
+ 	__skb_queue_head_init(&reinject);
+ 	srng = ath12k_ds_srng(ds, &ds->complete);
+ 	spin_lock_irqsave(&srng->lock, flags);
+@@ -566,7 +572,7 @@ int ath12k_wifi7_ds_service(struct ath12k_dp *dp, int budget)
+ 	 * packet separately; publish the counters once after the batch.
+ 	 */
+ 	spin_lock(&ds->tx_lock);
+-	while (done < budget) {
++	while (done < quota) {
+ 		status = ath12k_hal_srng_dst_get_next_entry(dp->ab, srng);
+ 		if (!status)
+ 			break;
+@@ -625,7 +631,8 @@ int ath12k_wifi7_ds_service(struct ath12k_dp *dp, int budget)
+ 		WRITE_ONCE(ds->faulted, true);
+ 	}
+ 	spin_unlock(&ds->tx_lock);
+-	ath12k_hal_srng_access_end(dp->ab, srng);
++	if (done)
++		ath12k_hal_srng_access_end(dp->ab, srng);
+ 	spin_unlock_irqrestore(&srng->lock, flags);
+ 	atomic64_add(completed, &ds->tx_completed);
+ 	atomic64_add(acked, &ds->tx_acked);
+@@ -640,7 +647,7 @@ int ath12k_wifi7_ds_service(struct ath12k_dp *dp, int budget)
+ 		qcom_ppe_ds_sync(ds->handle);
+ 	if (READ_ONCE(ds->faulted))
+ 		ath12k_ds_fault(ds);
+-	return done;
++	return (done + 3) >> 2;
+ }
+ 
+ /* control_lock held. The hardware rings stay registered across a VAP's

@@ -1,0 +1,26 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] wifi: ath12k: notify PPE after returning DS TX buffers
+
+After recycling a nonempty TX completion batch, notify the native PPE
+transport that its TX buffer pool can refill a stalled RXFILL ring. Call
+outside the WLAN pool and SRNG locks and only for successful returns,
+retaining the existing fault checks and batched index synchronization.
+Keep PPDU, monitor, rate and airtime statistics unchanged.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
+@@ -643,8 +643,11 @@
+ 		dev_put(dev);
+ 	}
+ 	ath12k_ds_flush_rx(ds);
+-	if (ds->handle && !READ_ONCE(ds->faulted))
++	if (ds->handle && !READ_ONCE(ds->faulted)) {
+ 		qcom_ppe_ds_sync(ds->handle);
++		if (completed)
++			qcom_ppe_ds_refill_ready(ds->handle);
++	}
+ 	if (READ_ONCE(ds->faulted))
+ 		ath12k_ds_fault(ds);
+ 	return (done + 3) >> 2;

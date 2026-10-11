@@ -1,0 +1,86 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] wifi: ath12k: batch native Direct Switch RX recycling
+
+PPE returns converted RX descriptor addresses in completion batches.
+Avoid scanning every partner allocation for adjacent descriptors by first
+checking the last validated device and allocation page. Cache indices,
+not pointers, and resolve them against the live group on every lookup.
+Range, alignment, magic, ownership and DMA direction checks are retained.
+
+Publish the recycled packet counter once per refill batch instead of an
+atomic update for each descriptor. This does not change monitor, PPDU or
+station statistics configuration or the hardware forwarding path.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
+@@ -78,6 +78,11 @@
+ 	struct work_struct fault_work;
+ 	struct dentry *debugfs;
+ 	struct list_head pending_rx[ATH12K_MAX_DEVICES];
++	/* Last validated allocation, protected by rx_lock. Cache indices only;
++	 * every lookup still checks the group's current descriptor storage.
++	 */
++	u16 rx_cookie_page;
++	u8 rx_cookie_device;
+ 	u32 buffer_count;
+ 	u32 reo_map[ATH12K_MAX_DEVICES];
+ 	unsigned long reo_mapped;
+@@ -218,9 +223,23 @@
+ 	size_t size = sizeof(struct ath12k_rx_desc_info) * ATH12K_MAX_SPT_ENTRIES;
+ 	int i, page;
+ 
++	lockdep_assert_held(&ds->rx_lock);
+ 	if (cookie != (unsigned long)cookie)
+ 		return NULL;
+ 	addr = cookie;
++	/* Completion batches commonly return adjacent descriptors. Try their
++	 * last allocation first without trusting or dereferencing the cookie.
++	 */
++	dp = group->dp[ds->rx_cookie_device];
++	if (dp && dp->rxbaddr && dp->ds_rx_bidir &&
++	    ds->rx_cookie_page < ATH12K_NUM_RX_SPT_PAGES(dp->ab)) {
++		base = (unsigned long)dp->rxbaddr[ds->rx_cookie_page];
++		if (base && addr >= base && addr - base < size &&
++		    !((addr - base) % sizeof(struct ath12k_rx_desc_info))) {
++			*owner = dp;
++			return (struct ath12k_rx_desc_info *)addr;
++		}
++	}
+ 	for (i = 0; i < ATH12K_MAX_DEVICES; i++) {
+ 		dp = group->dp[i];
+ 		if (!dp || !dp->rxbaddr || !dp->ds_rx_bidir)
+@@ -231,6 +250,8 @@
+ 			    (addr - base) % sizeof(struct ath12k_rx_desc_info))
+ 				continue;
+ 			*owner = dp;
++			ds->rx_cookie_device = i;
++			ds->rx_cookie_page = page;
+ 			return (struct ath12k_rx_desc_info *)addr;
+ 		}
+ 	}
+@@ -244,6 +265,7 @@
+ 	struct ath12k_dp *dp;
+ 	struct hal_srng *srng;
+ 	unsigned long flags;
++	unsigned int recycled = 0;
+ 	int i;
+ 
+ 	spin_lock_irqsave(&ds->rx_lock, flags);
+@@ -267,12 +289,14 @@
+ 			ath12k_hal_rx_buf_addr_info_set(dp->hal, entry,
+ 						       ATH12K_SKB_RXCB(rx->skb)->paddr,
+ 						       rx->cookie, dp->hal->hal_params->rx_buf_rbm);
+-			atomic64_inc(&ds->rx_recycled);
++			recycled++;
+ 		}
+ 		ath12k_hal_srng_access_end(dp->ab, srng);
+ 		spin_unlock(&srng->lock);
+ 	}
+ 	spin_unlock_irqrestore(&ds->rx_lock, flags);
++	if (recycled)
++		atomic64_add(recycled, &ds->rx_recycled);
+ }
+ 
+ static void ath12k_ds_release(void *priv, const u64 *cookies, unsigned int count)
