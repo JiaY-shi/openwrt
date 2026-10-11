@@ -1,0 +1,26 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] wifi: ath12k: fix IPQ5332 REO queue lookup register offsets
+
+IPQ5332 supports REO queue reference lookup, but enabling the capability
+alone is unsafe: its register table omits the queue address control and
+maximum peer ID offsets. Their implicit zero values alias REO_GEN_ENABLE,
+so LUT initialization overwrites the general enable register.
+
+Populate both offsets to match Qualcomm's IPQ5332 register table in
+wlan-ap. Keep the capability disabled: testing with WLAN.WBE.1.6-01270
+still crashes the MLO partner even with correct register offsets.
+This patch does not enable LUT setup or change firmware capabilities.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c
+@@ -430,6 +430,8 @@ const struct ath12k_hw_regs ipq5332_regs = {
+ 	.reo1_sw_cookie_cfg1 = 0x00000070,
+ 	.reo1_qdesc_lut_base0 = 0x00000074,
+ 	.reo1_qdesc_lut_base1 = 0x00000078,
++	.reo1_qdesc_addr = 0x0000007c,
++	.reo1_qdesc_max_peerid = 0x00000088,
+ 	.reo1_ring_base_lsb = 0x00000500,
+ 	.reo1_ring_base_msb = 0x00000504,
+ 	.reo1_ring_id = 0x00000508,
