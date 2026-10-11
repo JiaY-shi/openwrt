@@ -1,0 +1,98 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: wake stalled DS refill on WLAN returns
+
+RXFILL's low-buffer interrupt is masked when the WLAN TX buffer pool is
+short. Returning buffers on a WLAN completion previously only synchronized
+ring indices, leaving the refill to wait for the fallback retry timer.
+
+Add a batch notification which schedules PPE NAPI only after a short
+refill. Serialize it with stop, mask IRQs before scheduling, and keep the
+retry timer as a fallback. Publish and test the cross-NAPI short-refill
+flag with WRITE_ONCE/READ_ONCE. Count actual refill wakeups for validation.
+No ring descriptor, DMA ownership or firmware capability changes.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
+@@ -97,7 +97,7 @@
+ 	bool refill_short;
+ 	atomic64_t down_desc, up_desc, refilled, released;
+ 	atomic64_t index_updates, refill_failures;
+-	atomic64_t rx_retries;
++	atomic64_t rx_retries, refill_wakes;
+ };
+ 
+ /* Registration and supplier teardown are serialized. A registered WLAN
+@@ -228,6 +228,29 @@
+ }
+ EXPORT_SYMBOL_GPL(qcom_ppe_ds_sync);
+ 
++/* The WLAN pool can recover while RXFILL's level IRQ is masked after a
++ * short refill. Wake only that stalled refill, once per completed WLAN
++ * batch, rather than waiting for the index retry timer. The client must
++ * publish its free buffers and drop its pool/ring locks before calling.
++ */
++void qcom_ppe_ds_refill_ready(struct qcom_ppe_ds *ds)
++{
++	unsigned long flags;
++
++	if (!READ_ONCE(ds->refill_short))
++		return;
++
++	spin_lock_irqsave(&ds->index_lock, flags);
++	if (READ_ONCE(ds->running) && !READ_ONCE(ds->faulted) &&
++	    READ_ONCE(ds->refill_short) && napi_schedule_prep(&ds->napi)) {
++		ppe_ds_mask(ds);
++		atomic64_inc(&ds->refill_wakes);
++		__napi_schedule(&ds->napi);
++	}
++	spin_unlock_irqrestore(&ds->index_lock, flags);
++}
++EXPORT_SYMBOL_GPL(qcom_ppe_ds_refill_ready);
++
+ static int ppe_ds_refill(struct qcom_ppe_ds *ds, unsigned int budget)
+ {
+ 	u16 cons = ppe_ds_read(ds, EDMA_REG_RXFILL_CONS_IDX(ds->ring));
+@@ -271,8 +294,8 @@
+ 	dma_wmb();
+ 	ppe_ds_write(ds, EDMA_REG_RXFILL_PROD_IDX(ds->ring), ds->fill_prod);
+ 	atomic64_add(count, &ds->refilled);
+-	ds->refill_short = count < needed;
+-	if (ds->refill_short)
++	WRITE_ONCE(ds->refill_short, count < needed);
++	if (count < needed)
+ 		atomic64_inc(&ds->refill_failures);
+ 	return count;
+ }
+@@ -934,12 +957,13 @@
+ 		}
+ 		seq_printf(seq, "node:%d ring:%u queue:%u running:%u faulted:%u "
+ 			   "down_desc:%lld up_desc:%lld refill:%lld release:%lld "
+-			   "sync:%lld refill_fail:%lld rx_retry:%lld\n", i, ds->ring, ds->queue,
++			   "sync:%lld refill_fail:%lld rx_retry:%lld refill_wake:%lld\n",
++			   i, ds->ring, ds->queue,
+ 			   READ_ONCE(ds->running), READ_ONCE(ds->faulted),
+ 			   atomic64_read(&ds->down_desc), atomic64_read(&ds->up_desc),
+ 			   atomic64_read(&ds->refilled), atomic64_read(&ds->released),
+ 			   atomic64_read(&ds->index_updates), atomic64_read(&ds->refill_failures),
+-			   atomic64_read(&ds->rx_retries));
++			   atomic64_read(&ds->rx_retries), atomic64_read(&ds->refill_wakes));
+ 	}
+ 	mutex_unlock(&ppe_ds_lock);
+ 	return 0;
+--- a/include/linux/soc/qcom/ppe-ds.h
++++ b/include/linux/soc/qcom/ppe-ds.h
+@@ -54,6 +54,11 @@
+ int qcom_ppe_ds_stop(struct qcom_ppe_ds *ds);
+ int qcom_ppe_ds_unregister(struct qcom_ppe_ds *ds);
+ void qcom_ppe_ds_sync(struct qcom_ppe_ds *ds);
++/* Notify after publishing returned WLAN TX buffers, outside client locks
++ * and transport callbacks. Only a stalled refill is scheduled; DMA and
++ * descriptor ownership remain unchanged. The registered handle stays live.
++ */
++void qcom_ppe_ds_refill_ready(struct qcom_ppe_ds *ds);
+ u16 qcom_ppe_ds_queue(struct qcom_ppe_ds *ds);
+ /* Hold a VP reference while WLAN has a matching transmit-table entry.
+  * Allocation initially delivers to the CPU. Route to DS only after the
+

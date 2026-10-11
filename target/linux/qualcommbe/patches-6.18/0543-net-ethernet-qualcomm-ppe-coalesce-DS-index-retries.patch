@@ -1,0 +1,60 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: coalesce DS index retries
+
+The native transport keeps RXDESC interrupts masked while TCL owns a
+nonempty shared ring. Expose its retry interval so timer wakeups can be
+coalesced during sustained WLAN traffic. Keep the existing 250 us default
+until comparable throughput measurements support a longer interval. TX
+completion and low-buffer interrupts still schedule NAPI independently;
+idle rings retain RX IRQs.
+
+Expose a bounded runtime parameter to compare 250 and 500 us on the same
+firmware and restore the shorter interval if latency or throughput needs
+it. Changes affect the next one-shot retry; ring ownership, DMA ordering,
+fault isolation and stop synchronization are unchanged.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
+@@ -35,7 +35,29 @@
+ #define PPE_DS_FC_THRESH		(32 | (64 << 12))
+ #define PPE_DS_RXFILL_LOW_IRQ	BIT(0)
+ #define PPE_DS_RXFILL_LOW		128
+-#define PPE_DS_RX_RETRY_NS	(250 * NSEC_PER_USEC)
++
++static unsigned int ds_rx_retry_us = 250;
++
++static int ppe_ds_set_rx_retry(const char *val, const struct kernel_param *kp)
++{
++	unsigned int delay;
++	int ret;
++
++	ret = kstrtouint(val, 0, &delay);
++	if (ret)
++		return ret;
++	if (delay < 100 || delay > 1000)
++		return -EINVAL;
++	WRITE_ONCE(*(unsigned int *)kp->arg, delay);
++	return 0;
++}
++
++static const struct kernel_param_ops ppe_ds_rx_retry_ops = {
++	.set = ppe_ds_set_rx_retry,
++	.get = param_get_uint,
++};
++module_param_cb(ds_rx_retry_us, &ppe_ds_rx_retry_ops, &ds_rx_retry_us, 0644);
++MODULE_PARM_DESC(ds_rx_retry_us, "Direct Switch RX index retry delay (100-1000 us)");
+ 
+ enum ppe_ds_irq {
+ 	PPE_DS_RX,
+@@ -334,7 +356,8 @@
+ 				ppe_ds_write(ds, EDMA_REG_RXDESC_INT_MASK(ds->ring), 1);
+ 			else {
+ 				ppe_ds_write(ds, EDMA_REG_RXDESC_INT_MASK(ds->ring), 0);
+-				hrtimer_start(&ds->rx_timer, ns_to_ktime(PPE_DS_RX_RETRY_NS),
++				hrtimer_start(&ds->rx_timer,
++					      ns_to_ktime(READ_ONCE(ds_rx_retry_us) * NSEC_PER_USEC),
+ 					      HRTIMER_MODE_REL);
+ 			}
+ 			ppe_ds_write(ds, EDMA_REG_TX_INT_MASK(ds->ring), 1);

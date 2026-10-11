@@ -1,0 +1,45 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: expose DS transport availability
+
+Let a WLAN client check for a supported native Direct Switch provider
+before allocating rings and selecting bidirectional RX DMA mappings.
+The check runs in process context and is serialized with provider removal.
+Registration still validates and pins the provider; availability starts
+no DMA and does not relax the existing registration or stop checks.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
+@@ -109,6 +109,17 @@
+  */
+ static DEFINE_SPINLOCK(ppe_ds_fault_lock);
+ static struct ppe_ds_provider *ppe_ds_provider;
++
++bool qcom_ppe_ds_available(void)
++{
++	bool available;
++
++	mutex_lock(&ppe_ds_lock);
++	available = ppe_ds_provider != NULL;
++	mutex_unlock(&ppe_ds_lock);
++	return available;
++}
++EXPORT_SYMBOL_GPL(qcom_ppe_ds_available);
+ 
+ static u32 ppe_ds_read(struct qcom_ppe_ds *ds, u32 reg)
+ {
+--- a/include/linux/soc/qcom/ppe-ds.h
++++ b/include/linux/soc/qcom/ppe-ds.h
+@@ -50,6 +50,10 @@
+  * a hardware reset is required before those resources can be reclaimed.
+  */
+ struct qcom_ppe_ds *qcom_ppe_ds_register(const struct qcom_ppe_ds_config *cfg);
++/* Probe the supported transport in process context before allocating WLAN
++ * rings. Availability never starts DMA; register validates and pins it.
++ */
++bool qcom_ppe_ds_available(void);
+ int qcom_ppe_ds_start(struct qcom_ppe_ds *ds);
+ int qcom_ppe_ds_stop(struct qcom_ppe_ds *ds);
+ int qcom_ppe_ds_unregister(struct qcom_ppe_ds *ds);
+
