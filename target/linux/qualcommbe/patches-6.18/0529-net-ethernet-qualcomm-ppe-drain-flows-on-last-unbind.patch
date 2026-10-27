@@ -1,31 +1,165 @@
 From: Akshay Kakatkar <me@kakatkarakshay.dev>
 Date: Sat, 1 Aug 2026 05:45:00 +0530
-Subject: [PATCH] net: ethernet: qualcomm: ppe: drain flows when the last block unbinds
+Subject: [PATCH] net: ethernet: qualcomm: ppe: drain flows per released block
 
-Disabling hardware offload unbinds the flow blocks, and netfilter sends
-no destroy transaction for the rules it had installed. Their rows stay
-valid in hardware and keep claiming the traffic they were built for,
-which black-holes the wired hosts they point at until the next boot.
+Flowtable deletion unregisters its hooks before flushing its flows. Once
+its last callback is gone, FLOW_CLS_DESTROY cannot reach the PPE driver.
+Draining only when the PPE's entire callback list becomes empty covers a
+single flowtable, but leaks flows if another flowtable remains bound.
 
-Drain the remaining rules once the last block is gone, reusing the
-teardown path that already exists for module removal.
+Give each block callback its own flow list and release callback. Keep the
+existing shared callback identity and core reference count, so unbinding
+one of several ports does not flush a live block. Release only that
+block's remaining flows, leaving other flowtables untouched.
 
-Link: https://github.com/torvalds/linux/blob/v6.18/net/netfilter/nf_flow_table_offload.c
+Reuse the ordinary DESTROY transaction, including PPPoE, VLAN, tunnel,
+next-hop and virtual-port references. Unlink a flow before hardware
+cleanup so quarantined resources outlive the released block without
+retaining a pointer to its list. Concurrent topology cleanup may remove
+a copied cookie first; a later DESTROY returning ENOENT is harmless.
+
+This adapts the per-block release approach from issue 115 to the native
+ppe_flowtable implementation and preserves hardware-failure quarantine.
+Incremental port removal from a still-bound block continues to rely on
+normal netfilter DESTROY notifications.
+
+Link: https://github.com/perceival/openwrt-flint3/issues/115
+Link: https://gist.github.com/looong-cat/342669daa9e22c51f21001e49978f4e3
 Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
+Signed-off-by: JiaY-shi <shi05275@163.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
-@@ -3518,6 +3518,13 @@
- 			flow_block_cb_remove(block_cb, f);
- 			list_del(&block_cb->driver_list);
- 		}
+@@ -148,9 +148,19 @@
+ 
+ static_assert(offsetof(struct ppe_ft_vlan, ref) == 0);
+ 
++/* One reference-counted callback per flowtable block on this PPE.
++ * Flow membership is protected by ft->lock. The core serializes the last
++ * release against the block's REPLACE/DESTROY/STATS callbacks.
++ */
++struct ppe_ft_block {
++	struct ppe_flowtable *ft;
++	struct list_head flows;
++};
 +
-+		/* Netfilter sends no destroy transaction for the rules it
-+		 * installed here, so their rows would keep owning traffic
-+		 * in hardware once the last block is gone.
-+		 */
-+		if (list_empty(&ft->block_cb_list))
-+			ppe_ft_flow_drain(ft);
- 		return 0;
- 	default:
+ /**
+  * struct ppe_ft_flow - An offloaded flow.
+  * @node: Hash table node, keyed by the flow cookie.
++ * @block_node: Membership on the owning callback's flow list.
+  * @cookie: Flow cookie of the rule.
+  * @index: Hardware flow table index.
+  * @entry: The flow, kept for the delete command.
+@@ -168,6 +178,7 @@
+  */
+ struct ppe_ft_flow {
+ 	struct rhash_head node;
++	struct list_head block_node;
+ 	struct list_head zombie_node;
+ 	struct rcu_head rcu;
+ 	unsigned long cookie;
+@@ -1823,6 +1834,7 @@
+ }
+ 
+ static int ppe_ft_flow_replace(struct ppe_flowtable *ft,
++			       struct ppe_ft_block *block,
+ 			       struct flow_cls_offload *f)
+ {
+ 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+@@ -2601,6 +2613,7 @@
+ 	}
+ 
+ 	set_bit(nexthop, ft->nexthop_used);
++	list_add_tail(&flow->block_node, &block->flows);
+ 	mutex_unlock(&ft->lock);
+ 	if (tdev)
+ 		dev_put(tdev);
+@@ -2673,6 +2686,7 @@
+ 	}
+ 
+ 	rhashtable_remove_fast(&ft->flows, &flow->node, ppe_ft_params);
++	list_del(&flow->block_node);
+ 	ppe_vp_flow_del(ft->ppe_dev, flow->ivp, &flow->vp_flow);
+ 
+ 	if (ppe_ft_flow_hw_del(ft, flow)) {
+@@ -3421,10 +3435,41 @@
+ 						  &ppe_ft_reason_counters_fops);
+ }
+ 
++/* Topology notifications may remove a flow concurrently, but release
++ * excludes new callbacks for this block. Copy only its cookie under the
++ * flow lock and let the ordinary DESTROY path remove the list entry and
++ * all dependencies (or quarantine them after a hardware delete failure).
++ * Never hold the flow lock or an RCU read-side section across DESTROY.
++ */
++static void ppe_ft_block_release(void *cb_priv)
++{
++	struct ppe_ft_block *block = cb_priv;
++	struct ppe_flowtable *ft = block->ft;
++
++	for (;;) {
++		struct flow_cls_offload f = {};
++		struct ppe_ft_flow *flow;
++
++		mutex_lock(&ft->lock);
++		if (list_empty(&block->flows)) {
++			mutex_unlock(&ft->lock);
++			break;
++		}
++		flow = list_first_entry(&block->flows, struct ppe_ft_flow,
++					block_node);
++		f.cookie = flow->cookie;
++		mutex_unlock(&ft->lock);
++
++		ppe_ft_flow_destroy(ft, &f);
++	}
++	kfree(block);
++}
++
+ static int ppe_ft_block_cb(enum tc_setup_type type, void *type_data,
+ 			   void *cb_priv)
+ {
+-	struct ppe_flowtable *ft = cb_priv;
++	struct ppe_ft_block *block = cb_priv;
++	struct ppe_flowtable *ft = block->ft;
+ 	struct flow_cls_offload *f = type_data;
+ 	int ret;
+ 
+@@ -3433,7 +3478,7 @@
+ 
+ 	switch (f->command) {
+ 	case FLOW_CLS_REPLACE:
+-		ret = ppe_ft_flow_replace(ft, f);
++		ret = ppe_ft_flow_replace(ft, block, f);
+ 		atomic_long_inc(&ft->replace_calls);
+ 		if (ret == -EOPNOTSUPP)
+ 			atomic_long_inc(&ft->replace_unsupported);
+@@ -3483,6 +3528,7 @@
+ 	struct ppe_flowtable *ft = port_priv->ppe_port->ppe_dev->flowtable;
+ 	struct flow_block_offload *f = type_data;
+ 	struct flow_block_cb *block_cb;
++	struct ppe_ft_block *block;
+ 
+ 	if (!ft)
  		return -EOPNOTSUPP;
+@@ -3501,9 +3547,18 @@
+ 			return 0;
+ 		}
+ 
+-		block_cb = flow_block_cb_alloc(ppe_ft_block_cb, ft, ft, NULL);
+-		if (IS_ERR(block_cb))
++		block = kzalloc(sizeof(*block), GFP_KERNEL);
++		if (!block)
++			return -ENOMEM;
++		block->ft = ft;
++		INIT_LIST_HEAD(&block->flows);
++
++		block_cb = flow_block_cb_alloc(ppe_ft_block_cb, ft, block,
++					       ppe_ft_block_release);
++		if (IS_ERR(block_cb)) {
++			kfree(block);
+ 			return PTR_ERR(block_cb);
++		}
+ 
+ 		flow_block_cb_incref(block_cb);
+ 		flow_block_cb_add(block_cb, f);

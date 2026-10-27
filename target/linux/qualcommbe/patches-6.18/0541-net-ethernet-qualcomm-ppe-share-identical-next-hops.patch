@@ -214,11 +214,12 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  
  	ret = ppe_flow_entry_add(ft->ppe_dev, &flow->entry);
  	if (ret < 0)
-@@ -2899,7 +2989,6 @@
+@@ -2899,8 +2989,7 @@
  		}
  	}
  
 -	set_bit(nexthop, ft->nexthop_used);
+ 	list_add_tail(&flow->block_node, &block->flows);
  	mutex_unlock(&ft->lock);
  	if (tdev)
  		dev_put(tdev);

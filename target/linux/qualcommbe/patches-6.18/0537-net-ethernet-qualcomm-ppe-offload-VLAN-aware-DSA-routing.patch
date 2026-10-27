@@ -588,7 +588,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 +		 */
 +		if (!rtnl_trylock())
 +			return -EAGAIN;
- 		ret = ppe_ft_flow_replace(ft, f);
+ 		ret = ppe_ft_flow_replace(ft, block, f);
 +		rtnl_unlock();
  		atomic_long_inc(&ft->replace_calls);
  		if (ret == -EOPNOTSUPP)
