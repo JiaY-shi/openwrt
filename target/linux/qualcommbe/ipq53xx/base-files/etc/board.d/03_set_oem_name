@@ -1,0 +1,21 @@
+#!/bin/sh
+
+. /lib/functions/uci-defaults.sh
+. /lib/functions/system.sh
+
+ipq53xx_set_oem_name()
+{
+	local board="$1"
+	case $board in
+	gl.inet,gl-be6500)
+		oem_name="gl-be6500"
+		echo "$oem_name" > "$oem_file"
+		;;
+	esac
+}
+
+oem_file=/tmp/sysinfo/oem_name
+board=$(board_name)
+ipq53xx_set_oem_name $board
+
+exit 0
