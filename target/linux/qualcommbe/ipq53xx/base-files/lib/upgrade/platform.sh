@@ -1,5 +1,5 @@
 REQUIRE_IMAGE_METADATA=1
-RAMFS_COPY_BIN='fitblk fit_check_sign'
+RAMFS_COPY_BIN='fitblk fit_check_sign dumpimage'
 
 gl_be6500_remove_oem_rootfs() {
 	local mtdnum
@@ -27,12 +27,31 @@ gl_be6500_remove_oem_rootfs() {
 	}
 }
 
+gl_be6500_do_upgrade_fit() {
+	local pos
+
+	pos=$(dumpimage -l "$1" | grep "(ubi)" | awk '{print $2}')
+	[ -n "$pos" ] || {
+		echo "Unable to find ubi section in $1"
+		return 1
+	}
+
+	dumpimage -o /tmp/ubi.bin -T flat_dt -p "$pos" "$1" || return 1
+
+	nand_upgrade_ubinized /tmp/ubi.bin cat
+}
+
 platform_do_upgrade() {
 	case "$(board_name)" in
 	gl.inet,gl-be6500)
 		CI_UBIPART="rootfs"
-		gl_be6500_remove_oem_rootfs || return 1
-		nand_do_upgrade "$1"
+		if dumpimage -l "$1" >/dev/null 2>&1; then
+			UPGRADE_BACKUP=""
+			gl_be6500_do_upgrade_fit "$1"
+		else
+			gl_be6500_remove_oem_rootfs || return 1
+			nand_do_upgrade "$1"
+		fi
 		;;
 	ubnt,u7-pro-xgs)
 		CI_KERNPART="kernel0"
@@ -50,6 +69,12 @@ platform_check_image() {
 
 	case "$(board_name)" in
 	gl.inet,gl-be6500)
+		if dumpimage -l "$1" >/dev/null 2>&1; then
+			# Stock firmware FIT images must carry a "ubi" section
+			dumpimage -l "$1" | grep -q "(ubi)" && return 0
+			echo "Invalid image: no ubi section found"
+			return 1
+		fi
 		return 0
 		;;
 	ubnt,u7-pro-xgs)
