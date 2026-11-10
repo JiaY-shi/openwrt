@@ -1,0 +1,76 @@
+#!/bin/sh
+#
+# Apply the factory regulatory country stored in the ART partition.
+#
+# The base tree ships 95-gl-wireless-country, but it is gated to
+# gl.inet,gl-be9300 and reads the ART with find_mmc_part - both wrong for this
+# board, which is NAND and whose SMEM-parsed MTD label is lowercase "0:art".
+# So on the BE3600 nothing ever set a country and the radios came up in the
+# world ("00") regdomain, which restricts channels and power. Verified:
+# `iw reg get` reported country 00 on a fresh install although ART 0x88 held
+# a valid code.
+#
+# This script is the UPGRADE path only. On a fresh install the country comes
+# from board.json (board.d/02_network calls ucidef_set_country), because
+# mac80211.uc applies board.wlan.defaults.country to every wifi-device it
+# creates - including the QCN6432, which registers ~30 s after uci-defaults
+# have already run. Measured on a fresh install: this script alone set radio0 and
+# missed radio1 entirely. On an upgrade both radios already exist in
+# /etc/config/wireless, so config_foreach below reaches both.
+#
+# Offset 0x88, 2 bytes, ISO-3166. This mirrors what stock does
+# (gl-hw-info country_code = 0:ART 0x88).
+
+. /lib/functions.sh
+
+LOG_TAG=gl-be3600-country
+
+warn_manual() {
+	logger -t "$LOG_TAG" -p daemon.warn "$1"
+	logger -t "$LOG_TAG" -p daemon.warn \
+		"no regulatory country set; radios will use the world (00) domain." \
+		"Set one manually, e.g.: uci set wireless.radio0.country=<CC>;" \
+		"uci commit wireless; wifi"
+}
+
+[ "$(board_name)" = "gl.inet,gl-be3600" ] || exit 0
+
+art=$(find_mtd_part "0:art")
+if [ -z "$art" ]; then
+	warn_manual "ART partition (0:art) not found"
+	exit 0
+fi
+
+# Only a value that is not two letters at all means the field is unprogrammed.
+country=$(dd if="$art" bs=1 skip=136 count=2 2>/dev/null |
+	tr '[:lower:]' '[:upper:]' | tr -dc 'A-Z')
+
+if [ "${#country}" != 2 ]; then
+	warn_manual "ART regulatory field at 0x88 is not a valid ISO-3166 code"
+	exit 0
+fi
+
+[ -f /etc/config/wireless ] || /sbin/wifi config
+
+changed=0
+set_country() {
+	local dev="$1" cur
+	cur=$(uci -q get "wireless.$dev.country")
+	# '00' counts as unset: it is the world domain that wifi config writes
+	# when the board supplies no wlan defaults.
+	case "$cur" in
+	[A-Z][A-Z]) return 0 ;;
+	esac
+	uci set "wireless.$dev.country=$country"
+	changed=1
+}
+
+config_load wireless
+config_foreach set_country wifi-device
+
+if [ "$changed" = 1 ]; then
+	uci commit wireless
+	logger -t "$LOG_TAG" "set regulatory country to $country from ART 0x88"
+fi
+
+exit 0

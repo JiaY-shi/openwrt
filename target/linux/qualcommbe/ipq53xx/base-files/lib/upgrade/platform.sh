@@ -43,6 +43,16 @@ gl_be6500_do_upgrade_fit() {
 
 platform_do_upgrade() {
 	case "$(board_name)" in
+	gl.inet,gl-be3600)
+		CI_UBIPART="rootfs"
+		if dumpimage -l "$1" >/dev/null 2>&1; then
+			UPGRADE_BACKUP=""
+			gl_be6500_do_upgrade_fit "$1"
+		else
+			gl_be6500_remove_oem_rootfs || return 1
+			nand_do_upgrade "$1"
+		fi
+		;;
 	gl.inet,gl-be6500)
 		CI_UBIPART="rootfs"
 		if dumpimage -l "$1" >/dev/null 2>&1; then
@@ -68,6 +78,15 @@ platform_check_image() {
 	[ "$#" -gt 1 ] && return 1
 
 	case "$(board_name)" in
+	gl.inet,gl-be3600)
+		if dumpimage -l "$1" >/dev/null 2>&1; then
+			# Stock firmware FIT images must carry a "ubi" section
+			dumpimage -l "$1" | grep -q "(ubi)" && return 0
+			echo "Invalid image: no ubi section found"
+			return 1
+		fi
+		return 0
+		;;
 	gl.inet,gl-be6500)
 		if dumpimage -l "$1" >/dev/null 2>&1; then
 			# Stock firmware FIT images must carry a "ubi" section

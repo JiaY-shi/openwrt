@@ -1,0 +1,5 @@
+flashinit nand || exit 1
+
+imxtract $imgaddr ubi && flash rootfs || exit 1
+
+exit 0

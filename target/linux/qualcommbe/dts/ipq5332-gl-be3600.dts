@@ -1,0 +1,841 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause)
+/*
+ * GL.iNet GL-BE3600 (Slate 7)
+ *
+ * IPQ5312 (IPQ5332 family) / AP-MI04.1-C2
+ * - 2x QCA8081 2.5G PHYs: PPE port1 <- PCS0 <- PHY 0x1c (LAN),
+ *                         PPE port2 <- PCS1 <- PHY 0x18 (WAN)
+ * - QSPI NAND: Winbond W25N04KW 512 MiB (2k/128k), partitions from SMEM
+ * - Wi-Fi: IPQ5332 integrated 2.4G (ath12k AHB, board-id 27)
+ *          + QCN6432 5G (user PD 2, ath12k hybrid-bus patch 320, board-id 96)
+ * - USB 3.0: dwc3 + M31 HS PHY + the PCIe0/USB combo uniphy as SS PHY,
+ *   VBUS load switch enabled by GPIO32; PWM fan (ch2, tach GPIO31)
+ * - Side screen: ST7789P3 76x284 SPI TFT on BLSP0 SPI (fbtft, native
+ *   landscape fb0), PWM backlight (ch3), CST816S touch on bit-banged i2c
+ * - No LEDs. Reset button GPIO36, slide switch GPIO35.
+ *
+ * Facts derived from the stock firmware 4.9.2 DTB and a running stock device.
+ */
+
+/dts-v1/;
+
+#include <arm64/qcom/ipq5332.dtsi>
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/clock/qcom,ipq5332-nsscc.h>
+
+/ {
+	#address-cells = <0x2>;
+	#size-cells = <0x2>;
+	model = "GL.iNet GL-BE3600";
+	compatible = "gl.inet,gl-be3600", "qcom,ipq5332";
+
+	aliases {
+		serial0 = &blsp1_uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		/* clk_ignore_unused: same as stock DTS - the late clk-disable
+		 * pass kills U-Boot-enabled buses (eth/usb/wifi, even the
+		 * display backlight) on this platform.
+		 */
+		bootargs-append = " root=/dev/ubiblock0_1 clk_ignore_unused";
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		tzapp: tzapp@49600000 {
+			reg = <0x0 0x49600000 0x0 0x00600000>;
+			no-map;
+		};
+
+		/* Stock (QSDK) wifi memory map: the Q6 root PD code+data and PD1
+		 * data end at 0x4d200000, then m3 dump / etr / caldb for the
+		 * on-SoC radio, then the QCN6432 user-PD 2 regions, then the
+		 * MLO global memory.
+		 */
+		m3_dump: m3-dump@4d200000 {
+			reg = <0x0 0x4d200000 0x0 0x100000>;
+			no-map;
+		};
+
+		q6_etr: q6-etr-dump@4d300000 {
+			reg = <0x0 0x4d300000 0x0 0x100000>;
+			no-map;
+		};
+
+		q6_caldb: q6-caldb@4d400000 {
+			reg = <0x0 0x4d400000 0x0 0x500000>;
+			no-map;
+		};
+
+		q6_qcn6432_data: q6-qcn6432-data@4d900000 {
+			reg = <0x0 0x4d900000 0x0 0x1500000>;
+			no-map;
+		};
+
+		m3_dump_qcn6432: m3-dump-qcn6432@4ee00000 {
+			reg = <0x0 0x4ee00000 0x0 0x100000>;
+			no-map;
+		};
+
+		q6_qcn6432_etr: q6-qcn6432-etr@4ef00000 {
+			reg = <0x0 0x4ef00000 0x0 0x100000>;
+			no-map;
+		};
+
+		q6_qcn6432_caldb: q6-qcn6432-caldb@4f000000 {
+			reg = <0x0 0x4f000000 0x0 0x500000>;
+			no-map;
+		};
+
+		mlo_mem: mlo-global-mem@4fa00000 {
+			reg = <0x0 0x4fa00000 0x0 0x01200000>;
+			no-map;
+		};
+
+		/* Crash log that survives a warm reset (pstore/ramoops), in the
+		 * gap between the QCN6432 caldb and the MLO block. Read after
+		 * the next boot from /sys/fs/pstore/.
+		 */
+		ramoops@4f600000 {
+			compatible = "ramoops";
+			reg = <0x0 0x4f600000 0x0 0x100000>;
+			record-size = <0x20000>;
+			console-size = <0x80000>;
+			pmsg-size = <0>;
+			ecc-size = <0>;
+		};
+	};
+
+	/* USB port power. GPIO32 enables the 5 V VBUS load switch (stock exports
+	 * it as "usb_power", off at reset, switched on by userspace, toggled
+	 * off/on to power-cycle a wedged device). Modelled as a regulator and
+	 * given to both USB PHYs as their supply - the ipq5332 PHY bindings
+	 * describe vdd-supply as the port's 5 V rail on the reference boards -
+	 * so VBUS is on exactly while the USB controller is bound and powered:
+	 * no 5 V on the port before the driver runs, and unbinding or
+	 * suspending dwc3 drops it.
+	 */
+	usb_vbus: regulator-usb-vbus {
+		compatible = "regulator-fixed";
+		regulator-name = "usb_vbus";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		gpio = <&tlmm 32 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		pinctrl-0 = <&usb_pins>;
+		pinctrl-names = "default";
+	};
+
+	/* Side-screen backlight: PWM channel 3 (gpio25), the stock 12-level
+	 * table. fb_st7789p3 takes it over as fb0's backlight, so it comes on
+	 * once the panel shows its first frame and FBIOBLANK switches it.
+	 */
+	backlight: backlight {
+		compatible = "pwm-backlight";
+		pwms = <&pwm 3 40000>;
+		brightness-levels = <0 4 8 16 32 64 96 128 160 192 224 255>;
+		default-brightness-level = <10>;
+	};
+
+	/* Touch controller bus: bit-banged i2c on gpio33/34, as stock (the
+	 * pins are not on a BLSP i2c function).
+	 */
+	i2c-gpio {
+		compatible = "i2c-gpio";
+		pinctrl-0 = <&i2c_gpio_pins>;
+		pinctrl-names = "default";
+		sda-gpios = <&tlmm 34 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		scl-gpios = <&tlmm 33 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <2>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* Hynitron CST816S. The controller is programmed for the panel and
+		 * reports 0-283 x 0-75 with X mirrored against fb0 (measured:
+		 * top-left tap = 281,1; top-right = 2,1; bottom-right = 3,70),
+		 * so with touchscreen-inverted-x the events are fb0 coordinates.
+		 * Gestures (patch 2996 makes them complete key events) in the
+		 * binding's order: slide up, down, left, right, long press - the
+		 * chip's left/right follow its mirrored X axis, so the keys are
+		 * swapped to give the physical swipe direction (a left-to-right
+		 * swipe = KEY_RIGHT).
+		 */
+		touchscreen@15 {
+			compatible = "hynitron,cst816s";
+			reg = <0x15>;
+			pinctrl-0 = <&touch_pins>;
+			pinctrl-names = "default";
+			interrupt-parent = <&tlmm>;
+			interrupts = <39 IRQ_TYPE_EDGE_FALLING>;
+			reset-gpios = <&tlmm 37 GPIO_ACTIVE_LOW>;
+			touchscreen-size-x = <284>;
+			touchscreen-size-y = <76>;
+			touchscreen-inverted-x;
+			linux,keycodes = <KEY_UP>, <KEY_DOWN>, <KEY_RIGHT>, <KEY_LEFT>,
+					 <KEY_MENU>;
+		};
+	};
+
+	soc@0 {
+		/* QCN6432 5 GHz radio: user PD 2 on the Q6 ("hybrid" device - no
+		 * MMIO of its own, register window from firmware over QMI, GIC
+		 * MSIs). PD interrupts/states are the stock pd2 smp2p bits.
+		 */
+		wifi1: wifi-qcn6432 {
+			compatible = "qcom,qcn6432-wifi";
+			msi-parent = <&v2m0>;
+			interrupts-extended = <&smp2p_wcss_in 16 IRQ_TYPE_NONE>,
+					      <&smp2p_wcss_in 17 IRQ_TYPE_NONE>,
+					      <&smp2p_wcss_in 20 IRQ_TYPE_NONE>,
+					      <&smp2p_wcss_in 19 IRQ_TYPE_NONE>;
+			interrupt-names = "fatal",
+					  "ready",
+					  "spawn",
+					  "stop-ack";
+			qcom,smem-states = <&smp2p_wcss_out 16>,
+					   <&smp2p_wcss_out 17>,
+					   <&smp2p_wcss_out 18>;
+			qcom,smem-state-names = "shutdown",
+						"stop",
+						"spawn";
+			firmware-name = "ath12k/QCN6432/hw1.0/q6_fw2.mdt",
+					"ath12k/QCN6432/hw1.0/iu_fw.mdt";
+			/* q6_fw2 (0x4b4fd000) and iu_fw (0x4bd40000) are linked
+			 * into the shared Q6 region like PD1's images; the PD's
+			 * own host-DDR region (board data at its start) is the
+			 * stock q6_qcn6432_data block.
+			 */
+			memory-region = <&q6_region>, <&m3_dump_qcn6432>,
+					<&q6_qcn6432_caldb>, <&mlo_mem>,
+					<&q6_qcn6432_data>;
+			memory-region-names = "q6-region", "m3-dump", "q6-caldb",
+					      "mlo-global-mem", "host-ddr-mem";
+			/* BDF is downloaded to the start of host-ddr-mem
+			 * (0x4d900000), matching the stock PD2 board-data slot.
+			 */
+			qcom,bdf-address-offset = <0>;
+			qcom,ath12k-board-id = <96>;
+			nvmem-cells = <&base_macaddr 3>;
+			nvmem-cell-names = "mac-address";
+			/* PD2 must be in the SMEM 507 table too: the root PD
+			 * boots every user PD it finds there, in one shot.
+			 */
+			qcom,legacy-userpd-bootinfo;
+			qcom,rproc = <&q6v5_wcss>;
+			status = "okay";
+		};
+
+		gpio_keys {
+			compatible = "gpio-keys";
+			pinctrl-0 = <&button_pins>;
+			pinctrl-names = "default";
+			status = "okay";
+
+			reset {
+				label = "reset";
+				linux,code = <KEY_RESTART>;
+				gpios = <&tlmm 36 GPIO_ACTIVE_LOW>;
+				linux,input-type = <1>;
+			};
+
+			/*
+			 * Two-position slide switch. Stock declares this pin twice: GL's own
+			 * node (soc/gpio_keys, paired with reset) says ACTIVE_HIGH; a
+			 * root-level node left from the AP-MI04.1 reference design calls it
+			 * a WPS button, ACTIVE_LOW. GL's is authoritative. Measured:
+			 * back position = high, front = low.
+			 *
+			 * The code is deliberately not stock's: KEY_SETUP (0x8d) is absent
+			 * from OpenWrt's gpio-button-hotplug button_map and would emit no
+			 * event at all. BTN_0 + EV_SW gives BUTTON=BTN_0 TYPE=switch.
+			 */
+			switch {
+				label = "switch";
+				linux,code = <BTN_0>;
+				linux,input-type = <EV_SW>;
+				gpios = <&tlmm 35 GPIO_ACTIVE_HIGH>;
+			};
+		};
+
+		fan0: pwm-fan {
+			compatible = "pwm-fan";
+			pinctrl-0 = <&fan_pins>;
+			pinctrl-names = "default";
+			pwms = <&pwm 2 40000>;
+			interrupt-parent = <&tlmm>;
+			interrupts = <31 IRQ_TYPE_EDGE_RISING>;
+			pulses-per-revolution = <2>;
+			cooling-levels = <0 64 128 255>;
+			#cooling-cells = <2>;
+		};
+	};
+
+	thermal-zones {
+		cpu-top-thermal {
+			polling-delay = <1000>;
+
+			trips {
+				fan_trip_high: active-high {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "active";
+				};
+
+				fan_trip_med: active-med {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "active";
+				};
+
+				fan_trip_low: active-low {
+					temperature = <50000>;
+					hysteresis = <2000>;
+					type = "active";
+				};
+			};
+
+			cooling-maps {
+				fan-active-high {
+					cooling-device = <&fan0 3 3>;
+					trip = <&fan_trip_high>;
+				};
+
+				fan-active-med {
+					cooling-device = <&fan0 2 2>;
+					trip = <&fan_trip_med>;
+				};
+
+				fan-active-low {
+					cooling-device = <&fan0 1 1>;
+					trip = <&fan_trip_low>;
+				};
+			};
+		};
+	};
+};
+
+&blsp1_uart0 {
+	pinctrl-0 = <&serial_0_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+/* BLSP0 SPI: the side-screen panel, stock pinmux (hardware CS0 on gpio17) */
+&blsp1_spi0 {
+	pinctrl-0 = <&spi0_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	/* ST7789P3 76x284 TFT (fbtft driver fb_st7789p3, patch 2995). The
+	 * panel is mounted as a landscape strip; rotate 90 gives a native
+	 * 284x76 RGB565 /dev/fb0 that reads the right way up (the same
+	 * orientation the spinner's software rotation 270 produced).
+	 */
+	display@0 {
+		compatible = "sitronix,st7789p3";
+		reg = <0>;
+		spi-max-frequency = <50000000>;
+		buswidth = <8>;
+		width = <76>;
+		height = <284>;
+		rotate = <90>;
+		fps = <40>;
+		dc-gpios = <&tlmm 16 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&tlmm 24 GPIO_ACTIVE_LOW>;
+		te-gpios = <&tlmm 43 GPIO_ACTIVE_HIGH>;
+		backlight = <&backlight>;
+	};
+};
+
+&pwm {
+	#pwm-cells = <2>;
+	pinctrl-0 = <&pwm_pins>;
+	pinctrl-names = "default";
+	/* channel 2 = fan (gpio30); channel 3 = side-screen backlight (gpio25) */
+	status = "okay";
+};
+
+&tlmm {
+	/* mdio1_pins: gpio27 (mdc1) / gpio28 (mdio1). In the fivefold3
+	 * tree these come from the mdio dtsi patch; this tree's mdio dtsi
+	 * patch does not define them, so declare them here.
+	 */
+	mdio1_pins: mdio1-state {
+		mux_0 {
+			pins = "gpio27";
+			function = "mdc1";
+			drive-strength = <8>;
+			bias-disable;
+		};
+
+		mux_1 {
+			pins = "gpio28";
+			function = "mdio1";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+	};
+
+	qspi_nand_pins: qspi_nand_pins {
+		qspi_clock {
+			pins = "gpio13";
+			function = "qspi_clk";
+			drive-strength = <8>;
+			bias-disable;
+		};
+
+		qspi_cs {
+			pins = "gpio12";
+			function = "qspi_cs";
+			drive-strength = <8>;
+			bias-disable;
+		};
+
+		qspi_data {
+			pins = "gpio8", "gpio9", "gpio10", "gpio11";
+			function = "qspi_data";
+			drive-strength = <8>;
+			bias-disable;
+		};
+	};
+
+	button_pins: button_pins {
+		reset_button {
+			pins = "gpio36";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+
+		switch_button {
+			pins = "gpio35";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+	};
+
+	/* verbatim from stock: fan = pwm channel 2, backlight = channel 3 */
+	pwm_pins: pwm_pinmux {
+		pwm1 {
+			pins = "gpio30";
+			function = "pwm1";
+			drive-strength = <8>;
+		};
+
+		pwm2 {
+			pins = "gpio25";
+			function = "pwm2";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+	};
+
+	fan_pins: fan_pins {
+		/*
+		 * Fan supply enable, verbatim from stock. Without it the fan is never
+		 * powered: measured: 0 rpm at pwm=255 and 2855 rpm at pwm=255
+		 * with gpio29 driven high.
+		 */
+		pwr {
+			pins = "gpio29";
+			function = "gpio";
+			bias-pull-up;
+			output-high;
+		};
+
+		speed {
+			pins = "gpio31";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-down;
+		};
+	};
+
+	usb_pins: usb_pins {
+		/* VBUS switch enable, as stock: pulled down and low out of reset,
+		 * the usb_vbus regulator drives it.
+		 */
+		usb_pwr {
+			pins = "gpio32";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-down;
+			output-low;
+		};
+	};
+
+	/* Side screen, verbatim from stock: gpio14/15 SPI clock and MOSI,
+	 * gpio16 data/command (gpio), gpio17 hardware CS0, gpio43 tearing
+	 * effect input, gpio24 panel reset.
+	 */
+	spi0_pins: spi0_pins {
+		spi_clock {
+			pins = "gpio14";
+			function = "blsp0_spi";
+			drive-strength = <2>;
+			bias-pull-down;
+		};
+
+		spi_mosi {
+			pins = "gpio15";
+			function = "blsp0_spi";
+			drive-strength = <2>;
+			bias-pull-down;
+		};
+
+		spi_dc {
+			pins = "gpio16";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-pull-down;
+		};
+
+		spi_cs {
+			pins = "gpio17";
+			function = "blsp0_spi";
+			drive-strength = <2>;
+			bias-pull-up;
+		};
+
+		te {
+			pins = "gpio43";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-pull-up;
+		};
+
+		reset {
+			pins = "gpio24";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-pull-up;
+		};
+	};
+
+	i2c_gpio_pins: i2c_gpio_pins {
+		i2c {
+			pins = "gpio33", "gpio34";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+	};
+
+	touch_pins: touch_pins {
+		touch_reset {
+			pins = "gpio37";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+
+		touch_irq {
+			pins = "gpio39";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-up;
+		};
+	};
+
+	/* mdio1_pins (gpio27/28) comes from the dtsi (patch 0357) */
+};
+
+&mdio {
+	status = "okay";
+	pinctrl-0 = <&mdio1_pins>;
+	pinctrl-names = "default";
+
+	/* QCA8081, WAN, stock MDIO addr 0x18 */
+	phy0: ethernet-phy@18 {
+		compatible = "ethernet-phy-id004d.d101";
+		reg = <24>;
+		reset-gpios = <&tlmm 51 GPIO_ACTIVE_LOW>;
+		reset-assert-us = <10000>;
+		reset-deassert-us = <50000>;
+	};
+
+	/* QCA8081, LAN, stock MDIO addr 0x1c */
+	phy1: ethernet-phy@1c {
+		compatible = "ethernet-phy-id004d.d101";
+		reg = <28>;
+		reset-gpios = <&tlmm 49 GPIO_ACTIVE_LOW>;
+		reset-assert-us = <10000>;
+		reset-deassert-us = <50000>;
+	};
+};
+
+&qcom_ppe {
+	status = "okay";
+
+	ethernet-ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+			/* QSDK runs QCA8081 ports as uniphy SGMII with in-band
+			 * (Atheros-mode) autoneg. The PCS only supports in-band for
+			 * sgmii, so the initial mode must be sgmii; phylink switches
+			 * to 2500base-x (out-of-band) for a 2.5G peer.
+			 */
+			phy-mode = "sgmii";
+			managed = "in-band-status";
+			label = "lan";
+			nvmem-cells = <&base_macaddr 1>;
+			nvmem-cell-names = "mac-address";
+			pcs-handle = <&pcs0_ch0>;
+			phy-handle = <&phy1>;
+			clocks = <&nsscc NSS_CC_PORT1_MAC_CLK>,
+				 <&nsscc NSS_CC_PORT1_RX_CLK>,
+				 <&nsscc NSS_CC_PORT1_TX_CLK>;
+			clock-names = "mac",
+				      "rx",
+				      "tx";
+			resets = <&nsscc NSS_CC_PORT1_MAC_CLK_ARES>,
+				 <&nsscc NSS_CC_PORT1_RX_CLK_ARES>,
+				 <&nsscc NSS_CC_PORT1_TX_CLK_ARES>;
+			reset-names = "mac",
+				      "rx",
+				      "tx";
+		};
+
+		port@2 {
+			reg = <2>;
+			/* QSDK runs QCA8081 ports as uniphy SGMII with in-band
+			 * (Atheros-mode) autoneg. The PCS only supports in-band for
+			 * sgmii, so the initial mode must be sgmii; phylink switches
+			 * to 2500base-x (out-of-band) for a 2.5G peer.
+			 */
+			phy-mode = "sgmii";
+			managed = "in-band-status";
+			label = "wan";
+			nvmem-cells = <&base_macaddr 0>;
+			nvmem-cell-names = "mac-address";
+			pcs-handle = <&pcs1_ch0>;
+			phy-handle = <&phy0>;
+			clocks = <&nsscc NSS_CC_PORT2_MAC_CLK>,
+				 <&nsscc NSS_CC_PORT2_RX_CLK>,
+				 <&nsscc NSS_CC_PORT2_TX_CLK>;
+			clock-names = "mac",
+				      "rx",
+				      "tx";
+			resets = <&nsscc NSS_CC_PORT2_MAC_CLK_ARES>,
+				 <&nsscc NSS_CC_PORT2_RX_CLK_ARES>,
+				 <&nsscc NSS_CC_PORT2_TX_CLK_ARES>;
+			reset-names = "mac",
+				      "rx",
+				      "tx";
+		};
+	};
+};
+
+&pcs0 {
+	status = "okay";
+};
+
+&pcs1 {
+	status = "okay";
+};
+
+/*
+ * phy@4b0000 is the PCIe0/USB3 combo uniphy: one serdes, muxed to either the
+ * PCIe0 controller or the dwc3 SuperSpeed port by TCSR bit 0 at 0x1947540
+ * (the usb node's qcom,phy-usb-mux-sel, written by dwc3-qcom before it takes
+ * the controller out of reset). The Slate 7 has no PCIe0 device, so the node
+ * is retargeted at the USB SuperSpeed PHY driver: USB clocks and reset (stock
+ * ssuniphy@4b0000: pipe_clk, phy_cfg_ahb_clk, phy_ahb_clk, por_rst), the
+ * USB init table, and its pipe clock output feeds gcc's usb0_pipe_clk_src.
+ * Left under the PCIe PHY driver it would be programmed with PCIe Gen3
+ * PLL/EIOS values and never train - a "dwc3 registers but nothing
+ * enumerates" state. It stays a single node because dtc rejects
+ * two nodes at one unit address.
+ */
+&pcie0_phy {
+	compatible = "qcom,ipq5332-usb-uniphy";
+
+	clocks = <&gcc GCC_USB0_PIPE_CLK>,
+		 <&gcc GCC_USB0_PHY_CFG_AHB_CLK>,
+		 <&gcc GCC_PCIE3X1_PHY_AHB_CLK>;
+	clock-names = "pipe", "phy_cfg_ahb", "phy_ahb";
+
+	resets = <&gcc GCC_USB0_PHY_BCR>;
+	reset-names = "por_rst";
+
+	#clock-cells = <0>;
+	#phy-cells = <0>;
+	clock-output-names = "usb0_pipe_clk_src";
+
+	/* TCSR offset 0x10540 (absolute 0x1947540) muxes the shared
+	 * PCIe0/USB serdes to USB; dwc3-qcom writes it before releasing
+	 * the core, same value stock uses.
+	 */
+	qcom,phy-usb-mux-sel = <&tcsr 0x10540>;
+	vdd-supply = <&usb_vbus>;
+
+	/delete-property/ num-lanes;
+	status = "okay";
+};
+
+&usb {
+	/* Host-only port (Type-A), as stock's dwc3 node */
+	dr_mode = "host";
+	pinctrl-0 = <&usb_pins>;
+	pinctrl-names = "default";
+
+	clocks = <&gcc GCC_USB0_MASTER_CLK>,
+		 <&gcc GCC_USB0_SLEEP_CLK>,
+		 <&gcc GCC_USB0_MOCK_UTMI_CLK>,
+		 <&gcc GCC_USB0_AUX_CLK>,
+		 <&gcc GCC_USB0_LFPS_CLK>;
+	clock-names = "core", "sleep", "mock_utmi", "aux", "lfps";
+
+	/delete-property/ qcom,select-utmi-as-pipe-clk;
+	status = "okay";
+};
+
+&usbphy0 {
+	vdd-supply = <&usb_vbus>;
+	status = "okay";
+};
+
+&qpic_nand {
+	pinctrl-0 = <&qspi_nand_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	flash@0 {
+		compatible = "spi-nand";
+		reg = <0>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		nand-ecc-engine = <&qpic_nand>;
+		nand-ecc-strength = <8>;
+		nand-ecc-step-size = <512>;
+
+		partitions {
+			compatible = "qcom,smem-part";
+
+			partition-0-art {
+				label = "0:art";
+				read-only;
+
+				/* Factory addresses, as stock uses them:
+				 * +0 wan, +1 lan, +2 2.4 GHz radio,
+				 * +3 5 GHz radio.
+				 */
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					base_macaddr: mac-address@6 {
+						compatible = "mac-base";
+						reg = <0x6 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&qpic_bam {
+	status = "okay";
+};
+
+/*
+ * The bootstrap pins for the board select the XO clock frequency that
+ * supports 48 MHZ or 96 MHZ. This setting automatically enables the
+ * right dividers, to ensure the reference clock output from WiFi to
+ * the CMN PLL is 48 MHZ.
+ */
+&ref_48mhz_clk {
+	clock-div = <1>;
+	clock-mult = <1>;
+};
+
+&sleep_clk {
+	clock-frequency = <32000>;
+};
+
+/*
+ * The frequency of xo_board is fixed to 24 MHZ, which is routed
+ * from WiFi output clock 48 MHZ divided by 2.
+ */
+&xo_board {
+	clock-div = <2>;
+	clock-mult = <1>;
+};
+
+&xo_clk {
+	clock-frequency = <48000000>;
+};
+
+/* Integrated 2.4 GHz radio (ath12k AHB); stock qcom,board_id = 0x1b */
+/* Stock layout: root PD RO code (0x4a900000-0x4bd00000) followed by the
+ * writable block the ath12k fixed-memory model carves in place:
+ * BDF at +0x1400000 (0x4bd00000, stock PD1 board-data slot) and HOST_DDR
+ * right after it, up to 0x4d200000.
+ */
+&q6_region {
+	/* Must span both firmware segments: q6_fw1 loads at 0x4acfd000
+	 * and iu_fw at 0x4bd40000, ending at 0x4bd8bff8. Stock splits
+	 * this into q6_code_data + q6_ipq5332_data, but a single
+	 * carveout works because qcom_mdt_load only checks that every
+	 * segment falls inside this region.
+	 */
+	reg = <0x0 0x4a900000 0x0 0x2900000>;
+};
+
+&wifi0 {
+	firmware-name = "ath12k/IPQ5332/hw1.0/q6_fw1.mdt",
+			"ath12k/IPQ5332/hw1.0/iu_fw.mdt";
+	memory-region = <&q6_region>, <&m3_dump>, <&q6_caldb>, <&mlo_mem>,
+			<&q6_etr>;
+	memory-region-names = "q6-region", "m3-dump", "q6-caldb",
+			      "mlo-global-mem", "q6-etr-dump";
+	/* BDF goes to 0x4bd00000 = q6-region base (0x4a900000) plus
+	 * 0x1400000, where stock's q6_ipq5332_data starts. 918 keeps
+	 * this region0+offset path alive: 903-20 alone would demand a
+	 * named "host-ddr-mem" region and fail without one. The BDF is
+	 * written only after the UserPD has copied iu_fw (0x4bd40000)
+	 * into its own RAM, so the two share the carveout like stock.
+	 */
+	qcom,bdf-address-offset = <0x1400000>;
+	/* ath12k would otherwise use the address the firmware invents */
+	nvmem-cells = <&base_macaddr 2>;
+	nvmem-cell-names = "mac-address";
+	/* v10: the root PD discovers the user PDs (PD1 + PD2) from SMEM item
+	 * 507, which ath12k builds from every node carrying this property,
+	 * using this node's firmware-name for the load address. Keeping it
+	 * here also makes the root-PD boot-args below travel with the table.
+	 */
+	qcom,legacy-userpd-bootinfo;
+	qcom,rproc = <&q6v5_wcss>;
+	status = "okay";
+};
+
+&q6v5_wcss {
+	firmware-name = "ath12k/IPQ5332/hw1.0/q6_fw0.mdt";
+	/* Raw boot-args record the stock kernel hands the root PD in SMEM item
+	 * 507 ahead of the user-PD entries (type 1, length 5, payload
+	 * 3 1 0x2f 2 0). Copied verbatim from the stock DTS.
+	 *
+	 * v10: this replaces the older qcom,bootargs_smem + upd-firmware-names
+	 * pair. That pair made the remoteproc driver rewrite SMEM 507 inside
+	 * rproc_boot(), i.e. *after* ath12k had already filled it, so the
+	 * root-PD boot-args were dropped and the table was clobbered by a
+	 * second, subtly different writer. Now ath12k is the only writer.
+	 */
+	boot-args = <1 5 3 1 0x2f 2 0>;
+	status = "okay";
+};
