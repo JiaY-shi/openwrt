@@ -1,0 +1,64 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] wifi: ath12k: keep four-address peers on the mac80211 path
+
+Native Direct Switch attaches an authorized peer to its AP netdev. A WDS
+peer is subsequently moved into a per-station AP/VLAN by hostapd, but its
+PPE RX still enters the ordinary AP. Bridged source addresses are learned
+on the wrong port and replies fail to reach the backhaul station.
+
+Withdraw Direct Switch before programming four-address firmware mode; the
+routing command can otherwise replace the peer RX settings. Exclude such
+peers if authorization happens later. Reject hardware flow paths for them
+as well. Ordinary clients can continue using Direct Switch.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -6740,6 +6740,19 @@
+ 		arvif = arsta->arvif;
+ 		ahvif = arvif->ahvif;
+ 		ar = arvif->ar;
++		dp = ath12k_ab_to_dp(ar->ab);
++		/* Direct Switch binds RX to the AP netdev, not the per-STA
++		 * AP/VLAN. Withdraw an already authorized peer before using
++		 * four-address forwarding through mac80211.
++		 */
++		if (dp->ops->ds_sta_state) {
++			ret = dp->ops->ds_sta_state(ar, arvif, arsta, false);
++			if (ret) {
++				ath12k_warn(ar->ab, "failed to disable Direct Switch for 4addr peer %pM: %d\n",
++					    arsta->addr, ret);
++				return ret;
++			}
++		}
+ 
+ 		if (arvif->set_wds_vdev_param)
+ 			goto skip_nawds;
+--- a/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
+@@ -770,6 +770,11 @@
+ 
+ 	if (arvif->ahvif->vif->type != NL80211_IFTYPE_AP)
+ 		return 0;
++	/* Authorization can follow AP/VLAN assignment. Never re-enable
++	 * AP-bound hardware forwarding for a four-address peer.
++	 */
++	if (ahsta->enable_4addr)
++		enable = false;
+ 	link = ahsta->primary_link_id;
+ 	if (link >= IEEE80211_MLD_MAX_NUM_LINKS || !(links & BIT(link)))
+ 		return 0;
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -1175,7 +1175,9 @@
+ 				   struct net_device_path_ctx *ctx,
+ 				   struct net_device_path *path)
+ {
+-	if (vif->type != NL80211_IFTYPE_AP)
++	struct ath12k_sta *ahsta = sta ? ath12k_sta_to_ahsta(sta) : NULL;
++
++	if (vif->type != NL80211_IFTYPE_AP || (ahsta && ahsta->enable_4addr))
+ 		return -EOPNOTSUPP;
+ 
+ 	path->type = DEV_PATH_ETHERNET;

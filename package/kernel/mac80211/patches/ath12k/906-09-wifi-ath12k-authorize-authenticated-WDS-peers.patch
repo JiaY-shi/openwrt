@@ -1,0 +1,51 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] wifi: ath12k: authorize authenticated four-address AP peers
+
+A four-address EAPOL handshake may reach hostapd through the firmware
+unauthenticated-WDS exception path. Explicitly authorize an AP WDS peer
+in firmware after hostapd has authorized it. Handle both early and late
+AP/VLAN assignment without admitting data before userspace authorization.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -6728,6 +6728,7 @@
+ 	struct ath12k_dp *dp;
+ 	unsigned long links;
+ 	struct ath12k *ar;
++	bool authorized;
+ 	u8 link_id;
+ 	int ret;
+ 
+@@ -6792,6 +6793,7 @@
+ 		if (peer && peer->dp_peer) {
+ 			peer->dp_peer->ucast_ra_only = true;
+ 			peer->dp_peer->use_4addr = true;
++			authorized = peer->is_authorized;
+ 		} else {
+ 			spin_unlock_bh(&dp->dp_lock);
+ 			ath12k_warn(ar->ab, "failed to find DP peer for %pM\n",
+@@ -6800,6 +6802,22 @@
+ 		}
+ 
+ 		spin_unlock_bh(&dp->dp_lock);
++
++		/* Firmware can deliver the four-address EAPOL exchange through
++		 * the unauthenticated-WDS exception path. Once hostapd has
++		 * authorized the peer, explicitly authorize its WDS data path.
++		 */
++		if (ath12k_ahvif_to_vif(ahvif)->type == NL80211_IFTYPE_AP &&
++		    authorized) {
++			ret = ath12k_wmi_set_peer_param(ar, arsta->addr,
++							arvif->vdev_id,
++							WMI_PEER_AUTHORIZE, 1);
++			if (ret) {
++				ath12k_warn(ar->ab, "failed to authorize WDS peer %pM: %d\n",
++					    arsta->addr, ret);
++				return ret;
++			}
++		}
+ 	}
+ 
+ 	return 0;

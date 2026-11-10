@@ -1,0 +1,35 @@
+From: JiaY-shi <shi05275@163.com>
+Subject: [PATCH] wifi: ath12k: restore requested WDS mode after peer authorization
+
+hostapd may move a station into its four-address AP/VLAN before applying
+the association and authorization parameters. The driver caches that WDS
+has been enabled, but subsequent firmware peer setup can leave data
+frames hitting the unauthenticated-WDS error path.
+
+Reapply a previously requested four-address configuration after peer
+authorization. Keep the Direct Switch exclusion in effect across either
+ordering of VLAN assignment and authorization.
+
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -7523,6 +7523,18 @@
+ 			ath12k_warn(ab, "Failed to authorize station: %pM\n",
+ 				    arsta->addr);
+ 			goto exit;
++		}
++		/* hostapd can assign the AP/VLAN before the station association
++		 * parameters reach firmware. Reapply WDS after authorization so
++		 * peer association cannot leave the requested mode ineffective.
++		 */
++		if (arsta->ahsta->enable_4addr) {
++			ret = ath12k_mac_sta_set_4addr(hw->wiphy, arsta->ahsta);
++			if (ret) {
++				ath12k_warn(ab, "Failed to restore 4addr station %pM: %d\n",
++					    arsta->addr, ret);
++				goto exit;
++			}
+ 		}
+ 		if (ath12k_ab_to_dp(ab)->ops->ds_sta_state) {
+ 			int ds_ret;
