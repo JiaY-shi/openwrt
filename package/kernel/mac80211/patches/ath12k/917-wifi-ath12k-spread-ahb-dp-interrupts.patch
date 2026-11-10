@@ -1,0 +1,21 @@
+From: fivefold3 <332818675+fivefold3.noreply.github.com>
+Subject: [PATCH] wifi: ath12k: spread the AHB data-path interrupts over the CPUs
+
+The IPQ5332 requests its DP interrupts with the default affinity, so every
+tx completion and rx ring is served on CPU0. Place them with the helper
+the hybrid (QCN6432) path already uses (patch 320): tx completion ring N
+on CPU N+1, rx ring N on CPU N, like the PPE does for its EDMA rings.
+
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -885,8 +885,10 @@
+ 					       ath12k_ahb_ext_interrupt_handler,
+ 					       IRQF_TRIGGER_RISING,
+ 					       irq_name[irq_idx], irq_grp);
+ 			if (ret)
+ 				ath12k_warn(ab, "failed request_irq for %d\n", irq);
++			else
++				ath12k_ahb_dp_irq_set_affinity(ab, i, irq);
+ 		}
+ 	}
+

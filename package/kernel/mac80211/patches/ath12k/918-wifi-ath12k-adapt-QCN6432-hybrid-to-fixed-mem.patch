@@ -1,0 +1,117 @@
+From: Beaverfffan <Beaverfffan@users.noreply.github.com>
+Subject: wifi: ath12k: adapt QCN6432 hybrid bus to the fixed-memory model
+
+Adapt the QCN6432 hybrid-bus port to the 900-series fixed-memory
+refactor: the named host-ddr-mem BDF placement keeps offset 0, but a
+missing host-DDR region now falls back to region 0 plus the
+hw_params/DT offset, restoring qcom,bdf-address-offset support needed
+by the GL-BE3600 (AP-MI04.1-C2) board. Alias AFC_MEM_REGION_TYPE used
+by the hybrid-bus code to the existing AFC_REGION_TYPE, and add the
+hybrid bus fields to struct ath12k_ahb.
+
+---
+--- a/drivers/net/wireless/ath/ath12k/ahb.h	2026-11-09 05:12:59.120785153 +0000
++++ b/drivers/net/wireless/ath/ath12k/ahb.h	2026-11-09 05:14:31.824183023 +0000
+@@ -80,6 +80,23 @@
+ 	bool userpd_ready_acked;
+ 	bool userpd_stop_acked;
+ 	atomic_t userpd_crashed;
++
++	/* Hybrid bus (QCN6432): MSI-based interrupts, windowed register
++	 * access through a QMI-provided BAR.
++	 */
++	bool hybrid;
++	const struct ath12k_msi_config *msi_config;
++	u32 msi_ep_base_data;
++	u32 msi_addr_lo;
++	u32 msi_addr_hi;
++	int msi_irq[ATH12K_AHB_HYBRID_MSI_VECTORS];
++	u32 msi_data[ATH12K_AHB_HYBRID_MSI_VECTORS];
++	spinlock_t window_lock;
++	/* CE MSIs currently enabled, one bit per CE: keeps the reference
++	 * counted enable_irq()/disable_irq() as idempotent as the IE
++	 * register bits they stand in for.
++	 */
++	unsigned long ce_irq_on;
+ };
+ 
+ struct ath12k_ahb_driver {
+
+--- a/drivers/net/wireless/ath/ath12k/qmi.c	2026-11-09 05:12:59.120855337 +0000
++++ b/drivers/net/wireless/ath/ath12k/qmi.c	2026-11-09 05:14:31.825347377 +0000
+@@ -3121,6 +3121,7 @@
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 	struct reserved_mem *rmem;
+ 	size_t avail_rmem_size;
++	u32 bdf_addr_offset;
+ 	int i, idx, mlo_idx, ret;
+ 	int mlo_size = 0;
+ 
+@@ -3174,13 +3175,34 @@
+ 			idx++;
+ 			break;
+ 		case BDF_MEM_REGION_TYPE:
++			/* Board data sits at the start of the PD's host-DDR block
++			 * when one is named, else at an offset into region 0,
++			 * further adjusted by the DT property if present.
++			 */
+ 			rmem = ath12k_core_get_rmem_by_name(ab, "host-ddr-mem");
+-			if (!rmem) {
+-				ret = -ENODEV;
++			if (rmem) {
++				bdf_addr_offset = 0;
++			} else {
++				rmem = ath12k_core_get_reserved_mem(ab, 0);
++				if (!rmem) {
++					ret = -ENODEV;
++					goto out;
++				}
++				bdf_addr_offset = ab->hw_params->bdf_addr_offset;
++			}
++
++			of_property_read_u32(ab->dev->of_node,
++					     "qcom,bdf-address-offset",
++					     &bdf_addr_offset);
++
++			if (bdf_addr_offset >= rmem->size) {
++				ath12k_err(ab, "BDF offset %#x exceeds region size %pa\n",
++					   bdf_addr_offset, &rmem->size);
++				ret = -EINVAL;
+ 				goto out;
+ 			}
+ 
+-			avail_rmem_size = rmem->size;
++			avail_rmem_size = rmem->size - bdf_addr_offset;
+ 			if (avail_rmem_size < ab->qmi.target_mem[i].size) {
+ 				ath12k_dbg(ab, ATH12K_DBG_QMI,
+ 					   "failed to assign mem type %u req size %u avail size %zu\n",
+@@ -3190,7 +3212,7 @@
+ 				ret = -EINVAL;
+ 				goto out;
+ 			}
+-			ab->qmi.target_mem[idx].paddr = rmem->base;
++			ab->qmi.target_mem[idx].paddr = rmem->base + bdf_addr_offset;
+ 			ab->qmi.target_mem[idx].v.ioaddr =
+ 				ioremap(ab->qmi.target_mem[idx].paddr,
+ 					ab->qmi.target_mem[i].size);
+
+--- a/drivers/net/wireless/ath/ath12k/qmi.h
++++ b/drivers/net/wireless/ath/ath12k/qmi.h
+@@ -182,6 +182,7 @@
+ 	MLO_GLOBAL_MEM_REGION_TYPE = 0x8,
+ 	PAGEABLE_MEM_REGION_TYPE = 0x9,
+ 	AFC_REGION_TYPE = 0xa,
++	AFC_MEM_REGION_TYPE = 0xa,
+ 	LPASS_SHARED_V01_REGION_TYPE = 0xb,
+ };
+
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -3145,6 +3145,8 @@
+ 		case HOST_DDR_REGION_TYPE:
+ 			rmem = ath12k_core_get_rmem_by_name(ab, "host-ddr-mem");
++			if (!rmem)
++				rmem = ath12k_core_get_reserved_mem(ab, 0);
+ 			if (!rmem) {
+ 				ret = -ENODEV;
+ 				goto out;
