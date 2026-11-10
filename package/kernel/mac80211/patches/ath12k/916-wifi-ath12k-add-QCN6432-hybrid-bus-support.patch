@@ -1,0 +1,1449 @@
+From: fivefold3 <332818675+fivefold3.noreply.github.com>
+Subject: wifi: ath12k: add QCN6432 hybrid-bus (user PD 2) support
+
+QCN6432 is the 5 GHz companion radio of IPQ5332. It runs as user PD 2 on
+the SoC's Q6, is enumerated by the Q6 and appears to the host as a
+platform device without MMIO: the firmware reports the 2 MiB register
+window over QMI (device info, msg 0x004C), registers are accessed via
+PCI-style static windows, and interrupts are GICv2m platform MSIs
+(QDSS 1 / CE 5 / DP 8). HAL register layout equals IPQ5332.
+
+Modelled on QSDK's 822-ath12k-qcn6432-bring-up.patch. Also make the
+legacy SMEM-507 user-PD boot info describe every user PD sharing the
+root PD.
+
+diff -ruN a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -13,6 +13,7 @@
+ #include <linux/soc/qcom/mdt_loader.h>
+ #include <linux/soc/qcom/smem.h>
+ #include <linux/soc/qcom/smem_state.h>
++#include <linux/msi.h>
+ #include "ahb.h"
+ #include "debug.h"
+ #include "hif.h"
+@@ -226,7 +227,19 @@
+ 
+ static void ath12k_ahb_ce_irq_enable(struct ath12k_base *ab, u16 ce_id)
+ {
++	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
+ 	const struct ce_attr *ce_attr;
++
++	/* MSI: gate the Linux irq. enable_irq()/disable_irq() nest, and the
++	 * crash path skips the disable (ath12k_ahb_stop() under
++	 * CRASH_FLUSH) that recovery's ath12k_ahb_start() then undoes, so
++	 * only act on a real state change.
++	 */
++	if (ab_ahb->hybrid) {
++		if (!test_and_set_bit(ce_id, &ab_ahb->ce_irq_on))
++			enable_irq(ab->irq_num[ATH12K_IRQ_CE0_OFFSET + ce_id]);
++		return;
++	}
+ 	const struct ce_ie_addr *ce_ie_addr = ab->hw_params->ce_ie_addr;
+ 	u32 ie1_reg_addr, ie2_reg_addr, ie3_reg_addr;
+ 
+@@ -247,7 +260,14 @@
+ 
+ static void ath12k_ahb_ce_irq_disable(struct ath12k_base *ab, u16 ce_id)
+ {
++	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
+ 	const struct ce_attr *ce_attr;
++
++	if (ab_ahb->hybrid) {
++		if (test_and_clear_bit(ce_id, &ab_ahb->ce_irq_on))
++			disable_irq_nosync(ab->irq_num[ATH12K_IRQ_CE0_OFFSET + ce_id]);
++		return;
++	}
+ 	const struct ce_ie_addr *ce_ie_addr = ab->hw_params->ce_ie_addr;
+ 	u32 ie1_reg_addr, ie2_reg_addr, ie3_reg_addr;
+ 
+@@ -295,10 +315,37 @@
+ 	}
+ }
+ 
++/* Serve tx completion ring N on CPU N+1 and rx ring N on CPU N. ath12k
++ * queues on the TCL ring of the sending CPU, so completions land off the
++ * core that is queueing; rx spreads by the hardware's ring hash. Same
++ * idea as the PPE's edma_irq_set_affinity(). Groups carrying neither a tx
++ * nor an rx ring keep the default.
++ */
++static void ath12k_ahb_dp_irq_set_affinity(struct ath12k_base *ab, int grp_id,
++					   int irq)
++{
++	const struct ath12k_hw_ring_mask *ring_mask = ab->hw_params->ring_mask;
++	int cpu;
++
++	if (ring_mask->tx[grp_id])
++		cpu = fls(ring_mask->tx[grp_id]);		/* ring + 1 */
++	else if (ring_mask->rx[grp_id])
++		cpu = fls(ring_mask->rx[grp_id]) - 1;	/* ring */
++	else
++		return;
++
++	cpu %= num_possible_cpus();
++	if (irq_set_affinity(irq, cpumask_of(cpu)))
++		ath12k_warn(ab, "failed to set affinity of DP irq %d to CPU %d\n",
++			    irq, cpu);
++}
++
+ static void ath12k_ahb_ce_irqs_enable(struct ath12k_base *ab)
+ {
+ 	int i;
+ 
++	set_bit(ATH12K_FLAG_CE_IRQ_ENABLED, &ab->dev_flags);
++
+ 	for (i = 0; i < ab->hw_params->ce_count; i++) {
+ 		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+ 			continue;
+@@ -310,6 +357,8 @@
+ {
+ 	int i;
+ 
++	clear_bit(ATH12K_FLAG_CE_IRQ_ENABLED, &ab->dev_flags);
++
+ 	for (i = 0; i < ab->hw_params->ce_count; i++) {
+ 		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+ 			continue;
+@@ -377,23 +426,19 @@
+ 	return 0;
+ }
+ 
+-static int ath12k_ahb_prepare_userpd_boot_info(struct ath12k_base *ab)
++#define ATH12K_USERPD_BOOT_INFO_MAX_ENTRIES	3
++
++static int ath12k_ahb_userpd_boot_info_entry(struct ath12k_base *ab,
++					     struct device_node *np, u8 pid,
++					     struct ath12k_userpd_boot_info_entry *entry)
+ {
+-	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
+-	struct ath12k_userpd_boot_info boot_info = {};
+ 	const struct elf32_hdr *ehdr;
+ 	const struct firmware *fw;
+-	char fw_name[ATH12K_USERPD_FW_NAME_LEN];
++	const char *fw_name;
+ 	ssize_t image_size;
+-	size_t smem_size;
+-	void *smem;
+ 	int ret;
+ 
+-	if (!of_property_read_bool(ab->dev->of_node,
+-				   "qcom,legacy-userpd-bootinfo"))
+-		return 0;
+-
+-	ret = ath12k_ahb_get_firmware_name(ab, 0, fw_name, sizeof(fw_name));
++	ret = of_property_read_string_index(np, "firmware-name", 0, &fw_name);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -403,57 +448,153 @@
+ 
+ 	if (fw->size < sizeof(*ehdr)) {
+ 		ret = -EINVAL;
+-		goto out_release_fw;
++		goto out;
+ 	}
+ 
+ 	ehdr = (const struct elf32_hdr *)fw->data;
+ 	if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) ||
+ 	    ehdr->e_ident[EI_CLASS] != ELFCLASS32) {
+ 		ret = -EINVAL;
+-		goto out_release_fw;
++		goto out;
+ 	}
+ 
+ 	image_size = qcom_mdt_get_size(fw);
+ 	if (image_size <= 0 || image_size > U32_MAX) {
+ 		ret = image_size < 0 ? image_size : -EFBIG;
+-		goto out_release_fw;
++		goto out;
++	}
++
++	entry->header.type = ATH12K_USERPD_BOOT_INFO_TYPE;
++	entry->header.length = sizeof(*entry) - sizeof(entry->header);
++	entry->pid = pid;
++	entry->boot_addr = cpu_to_le32(ehdr->e_entry);
++	entry->data_size = cpu_to_le32(image_size);
++
++	ath12k_dbg(ab, ATH12K_DBG_AHB,
++		   "legacy userPD boot info pid %u addr 0x%x size 0x%x (%s)\n",
++		   pid, ehdr->e_entry, (u32)image_size, fw_name);
++	ret = 0;
++out:
++	release_firmware(fw);
++	return ret;
++}
++
++/* Raw boot-args bytes from the root PD's DT node ("boot-args", one byte per
++ * cell, e.g. <1 5 3 1 0x2f 2 0> = a type-1 record), placed ahead of the
++ * user PD entries exactly as the vendor multi-PD driver does.
++ */
++static int ath12k_ahb_get_rootpd_boot_args(struct ath12k_base *ab, u8 *buf,
++					   size_t buf_len)
++{
++	struct device_node *rproc_np;
++	int i, count;
++	u32 val;
++
++	rproc_np = of_parse_phandle(ab->dev->of_node, "qcom,rproc", 0);
++	if (!rproc_np)
++		return 0;
++
++	count = of_property_count_u32_elems(rproc_np, "boot-args");
++	if (count <= 0) {
++		of_node_put(rproc_np);
++		return 0;
++	}
++
++	if (count > buf_len) {
++		of_node_put(rproc_np);
++		return -ENOSPC;
++	}
++
++	for (i = 0; i < count; i++) {
++		of_property_read_u32_index(rproc_np, "boot-args", i, &val);
++		buf[i] = val;
++	}
++
++	of_node_put(rproc_np);
++	return count;
++}
++
++/* The root PD reads SMEM item 507 once, when it starts, so the table must
++ * describe every user PD sharing this root PD - the on-SoC radio and the
++ * companion radios - regardless of which device boots the root PD first.
++ *
++ * Layout (vendor multi-PD driver): u16 version, u16 payload length in bytes,
++ * then the raw root-PD boot-args bytes, then one 11-byte entry per user PD.
++ */
++static int ath12k_ahb_prepare_userpd_boot_info(struct ath12k_base *ab)
++{
++	struct ath12k_userpd_boot_info_entry entries[ATH12K_USERPD_BOOT_INFO_MAX_ENTRIES] = {};
++	u8 boot_args[64];
++	struct device_node *np;
++	size_t smem_size, table_size, payload;
++	void *smem;
++	__le16 hdr[2];
++	int n = 0, nargs, ret;
++	u8 pid;
++
++	if (!of_property_read_bool(ab->dev->of_node,
++				   "qcom,legacy-userpd-bootinfo"))
++		return 0;
++
++	nargs = ath12k_ahb_get_rootpd_boot_args(ab, boot_args, sizeof(boot_args));
++	if (nargs < 0)
++		return nargs;
++
++	for_each_node_with_property(np, "qcom,legacy-userpd-bootinfo") {
++		if (!of_device_is_available(np))
++			continue;
++		if (n >= ATH12K_USERPD_BOOT_INFO_MAX_ENTRIES) {
++			of_node_put(np);
++			return -ENOSPC;
++		}
++
++		if (of_device_is_compatible(np, "qcom,qcn6432-wifi"))
++			pid = ATH12K_QCN6432_USERPD_ID + 1;
++		else
++			pid = ATH12K_IPQ5332_USERPD_ID + 1;
++
++		ret = ath12k_ahb_userpd_boot_info_entry(ab, np, pid, &entries[n]);
++		if (ret) {
++			ath12k_warn(ab, "failed to build boot info for %pOF: %d\n",
++				    np, ret);
++			of_node_put(np);
++			return ret;
++		}
++		n++;
+ 	}
+ 
+-	boot_info.version = cpu_to_le16(ATH12K_USERPD_BOOT_INFO_VERSION);
+-	boot_info.data_len = cpu_to_le16(sizeof(boot_info.entry));
+-	boot_info.entry.header.type = ATH12K_USERPD_BOOT_INFO_TYPE;
+-	boot_info.entry.header.length = sizeof(boot_info.entry) -
+-					sizeof(boot_info.entry.header);
+-	boot_info.entry.pid = ab_ahb->userpd_id + 1;
+-	boot_info.entry.boot_addr = cpu_to_le32(ehdr->e_entry);
+-	boot_info.entry.data_size = cpu_to_le32(image_size);
++	if (!n)
++		return -ENODEV;
++
++	payload = nargs + n * sizeof(entries[0]);
++	table_size = sizeof(hdr) + payload;
++	hdr[0] = cpu_to_le16(ATH12K_USERPD_BOOT_INFO_VERSION);
++	hdr[1] = cpu_to_le16(payload);
+ 
+ 	ret = qcom_smem_alloc(ATH12K_USERPD_BOOT_INFO_REMOTE_PID,
+ 			      ATH12K_USERPD_BOOT_INFO_SMEM_ID,
+ 			      ATH12K_USERPD_BOOT_INFO_SMEM_SIZE);
+ 	if (ret && ret != -EEXIST)
+-		goto out_release_fw;
++		return ret;
+ 
+ 	smem = qcom_smem_get(ATH12K_USERPD_BOOT_INFO_REMOTE_PID,
+ 			     ATH12K_USERPD_BOOT_INFO_SMEM_ID, &smem_size);
+-	if (IS_ERR(smem)) {
+-		ret = PTR_ERR(smem);
+-		goto out_release_fw;
+-	}
+-	if (smem_size < sizeof(boot_info)) {
+-		ret = -ENOSPC;
+-		goto out_release_fw;
+-	}
++	if (IS_ERR(smem))
++		return PTR_ERR(smem);
++	if (smem_size < table_size)
++		return -ENOSPC;
+ 
+ 	memset_io(smem, 0, smem_size);
+-	memcpy_toio(smem, &boot_info, sizeof(boot_info));
+-	ath12k_info(ab, "legacy userPD boot info pid %u addr 0x%x size 0x%x\n",
+-		    boot_info.entry.pid, ehdr->e_entry, (u32)image_size);
+-	ret = 0;
++	memcpy_toio(smem, hdr, sizeof(hdr));
++	if (nargs)
++		memcpy_toio(smem + sizeof(hdr), boot_args, nargs);
++	memcpy_toio(smem + sizeof(hdr) + nargs, entries, n * sizeof(entries[0]));
++
++	ath12k_dbg(ab, ATH12K_DBG_AHB,
++		   "legacy userPD boot info: %d boot-args bytes, %d PD entries, %zu bytes\n",
++		   nargs, n, payload);
+ 
+-out_release_fw:
+-	release_firmware(fw);
+-	return ret;
++	return 0;
+ }
+ 
+ static int ath12k_ahb_power_up(struct ath12k_base *ab)
+@@ -635,6 +776,7 @@
+ 
+ static void ath12k_ahb_init_qmi_ce_config(struct ath12k_base *ab)
+ {
++	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
+ 	struct ath12k_qmi_ce_cfg *cfg = &ab->qmi.ce_cfg;
+ 
+ 	cfg->tgt_ce_len = ab->hw_params->target_ce_count;
+@@ -642,6 +784,12 @@
+ 	cfg->svc_to_ce_map_len = ab->hw_params->svc_to_ce_map_len;
+ 	cfg->svc_to_ce_map = ab->hw_params->svc_to_ce_map;
+ 	ab->qmi.service_ins_id = ab->hw_params->qmi_service_ins_id;
++
++	/* Companion radios run as further user PDs on the same Q6; the
++	 * firmware offsets their QMI instance by the PD index.
++	 */
++	if (ab_ahb->hybrid)
++		ab->qmi.service_ins_id += ab_ahb->userpd_id - 1;
+ }
+ 
+ static void ath12k_ahb_ce_tasklet(struct tasklet_struct *t)
+@@ -650,6 +798,13 @@
+ 
+ 	ath12k_ce_per_engine_service(ce_pipe->ab, ce_pipe->pipe_num);
+ 
++	/* Hybrid: a quiesce (crash path) may have begun while this ran; the
++	 * MSI stays masked until ath12k_ahb_start() re-enables the set.
++	 */
++	if (ath12k_ab_to_ahb(ce_pipe->ab)->hybrid &&
++	    !test_bit(ATH12K_FLAG_CE_IRQ_ENABLED, &ce_pipe->ab->dev_flags))
++		return;
++
+ 	ath12k_ahb_ce_irq_enable(ce_pipe->ab, ce_pipe->pipe_num);
+ }
+ 
+@@ -781,11 +936,17 @@
+ 	return 0;
+ }
+ 
++static int ath12k_ahb_hybrid_config_irq(struct ath12k_base *ab);
++
+ static int ath12k_ahb_config_irq(struct ath12k_base *ab)
+ {
++	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
+ 	int irq, irq_idx, i;
+ 	int ret;
+ 
++	if (ab_ahb->hybrid)
++		return ath12k_ahb_hybrid_config_irq(ab);
++
+ 	/* Configure CE irqs */
+ 	for (i = 0; i < ab->hw_params->ce_count; i++) {
+ 		struct ath12k_ce_pipe *ce_pipe = &ab->ce.ce_pipe[i];
+@@ -846,6 +1007,432 @@
+ 	return 0;
+ }
+ 
++
++/* ------------------------------------------------------------------------
++ * Hybrid bus: QCN6432, enumerated by the Q6 and exposed to the host as a
++ * platform device. Its registers are reached through a 2 MiB window whose
++ * address the firmware reports over QMI; the window is split into four
++ * 512 KiB static windows (window 2: CE, window 3: UMAC, window 1: other).
++ * Interrupts are GIC MSIs allocated through the platform MSI domain.
++ */
++#define ATH12K_AHB_WINDOW_ENABLE_BIT		0x40000000
++#define ATH12K_AHB_WINDOW_REG_ADDRESS		0x310c
++#define ATH12K_AHB_WINDOW_VALUE_MASK		GENMASK(24, 19)
++#define ATH12K_AHB_WINDOW_START			0x80000
++#define ATH12K_AHB_WINDOW_RANGE_MASK		GENMASK(18, 0)
++#define ATH12K_AHB_HYBRID_UMAC_BASE		0x00a00000
++#define ATH12K_AHB_HYBRID_CE_BASE		0x01b80000
++
++static const struct ath12k_msi_config ath12k_ahb_hybrid_msi_config = {
++	.total_vectors = ATH12K_AHB_HYBRID_MSI_VECTORS,
++	.total_users = 3,
++	.users = (struct ath12k_msi_user[]) {
++		{ .name = "QDSS", .num_vectors = 1, .base_vector = 0 },
++		{ .name = "CE", .num_vectors = 5, .base_vector = 1 },
++		{ .name = "DP", .num_vectors = 8, .base_vector = 6 },
++	},
++};
++
++static void ath12k_ahb_hybrid_config_static_window(struct ath12k_base *ab)
++{
++	u32 umac_window, ce_window, window;
++
++	umac_window = u32_get_bits(ATH12K_AHB_HYBRID_UMAC_BASE,
++				   ATH12K_AHB_WINDOW_VALUE_MASK);
++	ce_window = u32_get_bits(ATH12K_AHB_HYBRID_CE_BASE,
++				 ATH12K_AHB_WINDOW_VALUE_MASK);
++	window = (umac_window << 12) | (ce_window << 6);
++
++	iowrite32(ATH12K_AHB_WINDOW_ENABLE_BIT | window,
++		  ab->mem + ATH12K_AHB_WINDOW_REG_ADDRESS);
++	ath12k_dbg(ab, ATH12K_DBG_AHB, "static window 0x%x reads back 0x%x\n",
++		   ATH12K_AHB_WINDOW_ENABLE_BIT | window,
++		   ioread32(ab->mem + ATH12K_AHB_WINDOW_REG_ADDRESS));
++}
++
++/* Window 1 is dynamic: point it at the 512 KiB block holding offset */
++static void ath12k_ahb_hybrid_select_window(struct ath12k_base *ab, u32 offset)
++{
++	u32 window = u32_get_bits(offset, ATH12K_AHB_WINDOW_VALUE_MASK);
++	u32 prev, cur;
++	int retry = 0;
++
++	prev = ioread32(ab->mem + ATH12K_AHB_WINDOW_REG_ADDRESS) & ~0x3f;
++	cur = ATH12K_AHB_WINDOW_ENABLE_BIT | prev | window;
++	if (cur == (ATH12K_AHB_WINDOW_ENABLE_BIT | prev |
++		    (ioread32(ab->mem + ATH12K_AHB_WINDOW_REG_ADDRESS) & 0x3f)))
++		return;
++
++	iowrite32(cur, ab->mem + ATH12K_AHB_WINDOW_REG_ADDRESS);
++	while (ioread32(ab->mem + ATH12K_AHB_WINDOW_REG_ADDRESS) != cur &&
++	       retry++ < 10)
++		udelay(10);
++}
++
++static u32 ath12k_ahb_hybrid_window_start(struct ath12k_base *ab, u32 offset)
++{
++	if ((offset ^ ATH12K_AHB_HYBRID_UMAC_BASE) < ATH12K_AHB_WINDOW_RANGE_MASK)
++		return 3 * ATH12K_AHB_WINDOW_START;
++	if ((offset ^ ATH12K_AHB_HYBRID_CE_BASE) < ATH12K_AHB_WINDOW_RANGE_MASK)
++		return 2 * ATH12K_AHB_WINDOW_START;
++	return ATH12K_AHB_WINDOW_START;
++}
++
++static u32 ath12k_ahb_hybrid_read32(struct ath12k_base *ab, u32 offset)
++{
++	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++	u32 window_start, val;
++
++	if (WARN_ON_ONCE(!ab->mem))
++		return 0;
++
++	if (offset < ATH12K_AHB_WINDOW_START)
++		return ioread32(ab->mem + offset);
++
++	window_start = ath12k_ahb_hybrid_window_start(ab, offset);
++	if (window_start == ATH12K_AHB_WINDOW_START) {
++		spin_lock_bh(&ab_ahb->window_lock);
++		ath12k_ahb_hybrid_select_window(ab, offset);
++		val = ioread32(ab->mem + window_start +
++			       (offset & ATH12K_AHB_WINDOW_RANGE_MASK));
++		spin_unlock_bh(&ab_ahb->window_lock);
++		return val;
++	}
++
++	return ioread32(ab->mem + window_start +
++			(offset & ATH12K_AHB_WINDOW_RANGE_MASK));
++}
++
++static void ath12k_ahb_hybrid_write32(struct ath12k_base *ab, u32 offset,
++				      u32 value)
++{
++	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++	u32 window_start;
++
++	if (WARN_ON_ONCE(!ab->mem))
++		return;
++
++	if (offset < ATH12K_AHB_WINDOW_START) {
++		iowrite32(value, ab->mem + offset);
++		return;
++	}
++
++	window_start = ath12k_ahb_hybrid_window_start(ab, offset);
++	if (window_start == ATH12K_AHB_WINDOW_START) {
++		spin_lock_bh(&ab_ahb->window_lock);
++		ath12k_ahb_hybrid_select_window(ab, offset);
++		iowrite32(value, ab->mem + window_start +
++			  (offset & ATH12K_AHB_WINDOW_RANGE_MASK));
++		spin_unlock_bh(&ab_ahb->window_lock);
++		return;
++	}
++
++	iowrite32(value, ab->mem + window_start +
++		  (offset & ATH12K_AHB_WINDOW_RANGE_MASK));
++}
++
++static int ath12k_ahb_hybrid_get_user_msi_assignment(struct ath12k_base *ab,
++						     char *user_name,
++						     int *num_vectors,
++						     u32 *user_base_data,
++						     u32 *base_vector)
++{
++	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++	const struct ath12k_msi_config *msi_config = ab_ahb->msi_config;
++	int idx;
++
++	if (!msi_config)
++		return -EINVAL;
++
++	for (idx = 0; idx < msi_config->total_users; idx++) {
++		if (strcmp(user_name, msi_config->users[idx].name))
++			continue;
++
++		*num_vectors = msi_config->users[idx].num_vectors;
++		*base_vector = msi_config->users[idx].base_vector;
++		*user_base_data = *base_vector + ab_ahb->msi_ep_base_data;
++		return 0;
++	}
++
++	ath12k_err(ab, "failed to find MSI assignment for %s\n", user_name);
++	return -EINVAL;
++}
++
++static void ath12k_ahb_hybrid_get_msi_address(struct ath12k_base *ab,
++					      u32 *msi_addr_lo, u32 *msi_addr_hi)
++{
++	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++
++	*msi_addr_lo = ab_ahb->msi_addr_lo;
++	*msi_addr_hi = ab_ahb->msi_addr_hi;
++}
++
++static void ath12k_ahb_hybrid_get_ce_msi_idx(struct ath12k_base *ab, u32 ce_id,
++					     u32 *msi_idx)
++{
++	u32 i, msi_data_idx;
++
++	for (i = 0, msi_data_idx = 0; i < ab->hw_params->ce_count; i++) {
++		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
++			continue;
++
++		if (ce_id == i)
++			break;
++
++		msi_data_idx++;
++	}
++	*msi_idx = msi_data_idx;
++}
++
++static void ath12k_ahb_hybrid_write_msi_msg(struct msi_desc *desc,
++					    struct msi_msg *msg)
++{
++	struct device *dev = msi_desc_to_dev(desc);
++	struct ath12k_base *ab = dev_get_drvdata(dev);
++	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++
++	if (desc->msi_index >= ATH12K_AHB_HYBRID_MSI_VECTORS)
++		return;
++
++	ab_ahb->msi_data[desc->msi_index] = msg->data;
++	/* One doorbell for all vectors; the first vector actually
++	 * requested is the first to be composed (vector 0 never is).
++	 */
++	if (msg->address_lo || msg->address_hi) {
++		ab_ahb->msi_addr_lo = msg->address_lo;
++		ab_ahb->msi_addr_hi = msg->address_hi;
++	}
++}
++
++static void ath12k_ahb_hybrid_free_irqs(struct ath12k_base *ab)
++{
++	struct ath12k_ext_irq_grp *irq_grp;
++	int i, irq_idx;
++
++	for (i = 0; i < ab->hw_params->ce_count; i++) {
++		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
++			continue;
++		irq_idx = ATH12K_IRQ_CE0_OFFSET + i;
++		if (ab->irq_num[irq_idx] > 0)
++			free_irq(ab->irq_num[irq_idx], &ab->ce.ce_pipe[i]);
++		ab->irq_num[irq_idx] = 0;
++	}
++
++	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
++		irq_grp = &ab->ext_irq_grp[i];
++		if (!irq_grp->num_irq)
++			continue;
++		irq_idx = irq_grp->irqs[0];
++		if (ab->irq_num[irq_idx] > 0)
++			free_irq(ab->irq_num[irq_idx], irq_grp);
++		ab->irq_num[irq_idx] = 0;
++		irq_grp->num_irq = 0;
++	}
++}
++
++static int ath12k_ahb_hybrid_config_irq(struct ath12k_base *ab)
++{
++	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++	const struct ath12k_hw_ring_mask *ring_mask = ab->hw_params->ring_mask;
++	struct ath12k_ext_irq_grp *irq_grp;
++	struct ath12k_ce_pipe *ce_pipe;
++	u32 msi_data_count, msi_data_start, msi_irq_start, msi_data_idx;
++	u32 dp_count, dp_start, dp_irq_start;
++	int i, irq, irq_idx, vector, ret;
++
++	spin_lock_init(&ab_ahb->window_lock);
++	ab_ahb->msi_config = &ath12k_ahb_hybrid_msi_config;
++
++	ret = platform_device_msi_init_and_alloc_irqs(ab->dev,
++						      ATH12K_AHB_HYBRID_MSI_VECTORS,
++						      ath12k_ahb_hybrid_write_msi_msg);
++	if (ret) {
++		ath12k_err(ab, "failed to allocate %d platform MSIs: %d\n",
++			   ATH12K_AHB_HYBRID_MSI_VECTORS, ret);
++		return ret;
++	}
++
++	for (i = 0; i < ATH12K_AHB_HYBRID_MSI_VECTORS; i++) {
++		ab_ahb->msi_irq[i] = msi_get_virq(ab->dev, i);
++		if (ab_ahb->msi_irq[i] <= 0) {
++			ath12k_err(ab, "no virq for MSI vector %d\n", i);
++			ret = -ENODEV;
++			goto err_free_msi;
++		}
++	}
++	/* The MSI message (GIC SPI number + doorbell address) is only composed
++	 * when a vector is activated, i.e. at request_irq(); the base data is
++	 * derived below once the CE and DP vectors have been requested.
++	 */
++
++	ret = ath12k_ahb_hybrid_get_user_msi_assignment(ab, "CE", &msi_data_count,
++							&msi_data_start,
++							&msi_irq_start);
++	if (ret)
++		goto err_free_msi;
++
++	/* CE interrupts, shared round-robin over the CE vectors like PCI */
++	for (i = 0, msi_data_idx = 0; i < ab->hw_params->ce_count; i++) {
++		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
++			continue;
++
++		vector = (msi_data_idx % msi_data_count) + msi_irq_start;
++		irq = ab_ahb->msi_irq[vector];
++		ce_pipe = &ab->ce.ce_pipe[i];
++		irq_idx = ATH12K_IRQ_CE0_OFFSET + i;
++
++		/* Same bottom half as the wired AHB path: the CE enable/disable
++		 * hooks it uses are hybrid-aware.
++		 */
++		tasklet_setup(&ce_pipe->intr_tq, ath12k_ahb_ce_tasklet);
++
++		ret = request_irq(irq, ath12k_ahb_ce_interrupt_handler,
++				  IRQF_SHARED, irq_name[irq_idx], ce_pipe);
++		if (ret) {
++			ath12k_err(ab, "failed to request CE%d MSI irq %d: %d\n",
++				   i, irq, ret);
++			goto err_free_msi;
++		}
++
++		ab->irq_num[irq_idx] = irq;
++		msi_data_idx++;
++
++		/* request_irq() leaves it enabled: record that, then disable */
++		set_bit(i, &ab_ahb->ce_irq_on);
++		ath12k_ahb_ce_irq_disable(ab, i);
++	}
++
++	ret = ath12k_ahb_hybrid_get_user_msi_assignment(ab, "DP", &dp_count,
++							&dp_start, &dp_irq_start);
++	if (ret)
++		goto err_free_msi;
++
++	/* DP interrupt groups, one MSI per group */
++	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
++		irq_grp = &ab->ext_irq_grp[i];
++		irq_grp->ab = ab;
++		irq_grp->grp_id = i;
++
++		irq_grp->napi_ndev = alloc_netdev_dummy(0);
++		if (!irq_grp->napi_ndev) {
++			ret = -ENOMEM;
++			goto err_free_msi;
++		}
++
++		netif_napi_add(irq_grp->napi_ndev, &irq_grp->napi,
++			       ath12k_ahb_ext_grp_napi_poll);
++
++		if (!(ring_mask->tx[i] || ring_mask->rx[i] ||
++		      ring_mask->rx_err[i] || ring_mask->rx_wbm_rel[i] ||
++		      ring_mask->reo_status[i] || ring_mask->host2rxdma[i] ||
++		      ring_mask->rx_mon_dest[i] || ring_mask->tx_mon_dest[i])) {
++			irq_grp->num_irq = 0;
++			continue;
++		}
++
++		irq_idx = ATH12K_IRQ_CE0_OFFSET + CE_COUNT_MAX + i;
++		vector = (i % dp_count) + dp_irq_start;
++		irq = ab_ahb->msi_irq[vector];
++
++		irq_set_status_flags(irq, IRQ_DISABLE_UNLAZY);
++		ret = request_irq(irq, ath12k_ahb_ext_interrupt_handler,
++				  IRQF_SHARED, "DP_EXT_IRQ", irq_grp);
++		if (ret) {
++			ath12k_err(ab, "failed to request DP MSI irq %d: %d\n",
++				   irq, ret);
++			goto err_free_msi;
++		}
++
++		/* Record the irq only once it is really registered: the free
++		 * path keys off num_irq/irq_num, so publishing them before
++		 * request_irq() would make a failure here free an irq that was
++		 * never taken. The CE loop above already gets this right.
++		 */
++		irq_grp->num_irq = 1;
++		irq_grp->irqs[0] = irq_idx;
++		ab->irq_num[irq_idx] = irq;
++		ath12k_ahb_dp_irq_set_affinity(ab, i, irq);
++
++		ath12k_ahb_ext_grp_disable(irq_grp);
++	}
++
++	/* GICv2m hands out one contiguous SPI block for the allocation, so
++	 * data(vector) = base + vector. Derive the base from the first CE
++	 * vector and check the others against it.
++	 */
++	if (!ab_ahb->msi_data[msi_irq_start]) {
++		ath12k_err(ab, "MSI vector %u has no message after request\n",
++			   msi_irq_start);
++		ret = -EINVAL;
++		goto err_free_msi;
++	}
++	ab_ahb->msi_ep_base_data = ab_ahb->msi_data[msi_irq_start] - msi_irq_start;
++
++	if (!ab_ahb->msi_addr_lo && !ab_ahb->msi_addr_hi) {
++		ath12k_err(ab, "MSI doorbell address unknown after request\n");
++		ret = -EINVAL;
++		goto err_free_msi;
++	}
++
++	for (i = msi_irq_start; i < ATH12K_AHB_HYBRID_MSI_VECTORS; i++) {
++		if (!ab_ahb->msi_data[i])
++			continue;
++		if (ab_ahb->msi_data[i] != ab_ahb->msi_ep_base_data + i) {
++			ath12k_err(ab, "MSI vector %d data %u not contiguous (base %u)\n",
++				   i, ab_ahb->msi_data[i], ab_ahb->msi_ep_base_data);
++			ret = -EINVAL;
++			goto err_free_msi;
++		}
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_AHB,
++		   "hybrid MSI: addr 0x%x%08x SPI data base %u, %d vectors\n",
++		   ab_ahb->msi_addr_hi, ab_ahb->msi_addr_lo,
++		   ab_ahb->msi_ep_base_data, ATH12K_AHB_HYBRID_MSI_VECTORS);
++
++	return 0;
++
++err_free_msi:
++	ath12k_ahb_hybrid_free_irqs(ab);
++	platform_device_msi_free_irqs_all(ab->dev);
++	return ret;
++}
++
++/* ath12k_core_reset() quiesces the CEs through this op on the crash path.
++ * The AHB ops leave it out: there the CE interrupt enables are target
++ * registers that the Q6 restart clears. The hybrid ones are host MSIs that
++ * stay live across the restart, so a CE interrupt during recovery runs the
++ * tasklet, which re-posts rx buffers before ath12k_core_start() has
++ * re-initialised HTC; the restarted target's HTC ready then lands in them,
++ * is consumed, and ath12k_htc_init() wipes it ("ctl_resp never came in").
++ * Same sequence as ath12k_pci_hif_ce_irq_disable(); the tasklet honours
++ * the cleared CE_IRQ_ENABLED flag, so nothing re-arms behind this.
++ */
++static void ath12k_ahb_hybrid_ce_irq_disable(struct ath12k_base *ab)
++{
++	ath12k_ahb_ce_irqs_disable(ab);
++	ath12k_ahb_sync_ce_irqs(ab);
++	ath12k_ahb_cancel_tasklet(ab);
++}
++
++static const struct ath12k_hif_ops ath12k_ahb_hybrid_hif_ops = {
++	.start = ath12k_ahb_start,
++	.stop = ath12k_ahb_stop,
++	.read32 = ath12k_ahb_hybrid_read32,
++	.write32 = ath12k_ahb_hybrid_write32,
++	.irq_enable = ath12k_ahb_ext_irq_enable,
++	.irq_disable = ath12k_ahb_ext_irq_disable,
++	.ce_irq_enable = ath12k_ahb_ce_irqs_enable,
++	.ce_irq_disable = ath12k_ahb_hybrid_ce_irq_disable,
++	.map_service_to_pipe = ath12k_ahb_map_service_to_pipe,
++	.power_up = ath12k_ahb_power_up,
++	.power_down = ath12k_ahb_power_down,
++	.get_user_msi_vector = ath12k_ahb_hybrid_get_user_msi_assignment,
++	.get_msi_address = ath12k_ahb_hybrid_get_msi_address,
++	.get_ce_msi_idx = ath12k_ahb_hybrid_get_ce_msi_idx,
++	.config_static_window = ath12k_ahb_hybrid_config_static_window,
++};
++
+ static const struct ath12k_hif_ops ath12k_ahb_hif_ops = {
+ 	.start = ath12k_ahb_start,
+ 	.stop = ath12k_ahb_stop,
+@@ -1135,6 +1722,10 @@
+ 	struct resource *mem_res;
+ 	int ret;
+ 
++	/* Hybrid: the register window is learnt from firmware over QMI */
++	if (ab_ahb->hybrid)
++		return 0;
++
+ 	ab->mem = devm_platform_get_and_ioremap_resource(pdev, 0, &mem_res);
+ 	if (IS_ERR(ab->mem)) {
+ 		ret = dev_err_probe(&pdev->dev, PTR_ERR(ab->mem), "ioremap error\n");
+@@ -1196,6 +1787,15 @@
+ {
+ 	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
+ 
++	if (ab_ahb->hybrid) {
++		if (ab->mem)
++			iounmap(ab->mem);
++		ab->mem = NULL;
++		ath12k_ahb_hybrid_free_irqs(ab);
++		platform_device_msi_free_irqs_all(ab->dev);
++		return;
++	}
++
+ 	if (ab->mem)
+ 		devm_iounmap(ab->dev, ab->mem);
+ 
+@@ -1278,6 +1878,9 @@
+ 		goto err_core_free;
+ 	}
+ 
++	if (ab_ahb->hybrid)
++		ab->hif.ops = &ath12k_ahb_hybrid_hif_ops;
++
+ 	/* Set fixed_mem_region to true for platforms that support fixed memory
+ 	 * reservation from DT. If memory is reserved from DT for FW, ath12k driver
+ 	 * need not to allocate memory.
+diff -ruN a/drivers/net/wireless/ath/ath12k/ahb.h b/drivers/net/wireless/ath/ath12k/ahb.h
+--- a/drivers/net/wireless/ath/ath12k/ahb.h
++++ b/drivers/net/wireless/ath/ath12k/ahb.h
+@@ -10,6 +10,7 @@
+ #include <linux/remoteproc/qcom_rproc.h>
+ #include <linux/platform_device.h>
+ #include "core.h"
++#include "pci.h"
+ 
+ #define ATH12K_AHB_RECOVERY_TIMEOUT (3 * HZ)
+ 
+@@ -28,6 +29,7 @@
+ #define ATH12K_USERPD_READY_TIMEOUT		(10 * HZ)
+ #define ATH12K_USERPD_STOP_TIMEOUT		(5 * HZ)
+ #define ATH12K_USERPD_ID_MASK			GENMASK(9, 8)
++#define ATH12K_AHB_HYBRID_MSI_VECTORS		14
+ #define ATH12K_USERPD_FW_NAME_LEN		128
+ 
+ enum ath12k_ahb_smp2p_msg_id {
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -159,6 +159,7 @@
+ 	ATH12K_HW_IPQ5332_HW10,
+ 	ATH12K_HW_QCC2072_HW10,
+ 	ATH12K_HW_IPQ5424_HW10,
++	ATH12K_HW_QCN6432_HW10,
+ };
+ 
+ enum ath12k_firmware_mode {
+diff -ruN a/drivers/net/wireless/ath/ath12k/hif.h b/drivers/net/wireless/ath/ath12k/hif.h
+--- a/drivers/net/wireless/ath/ath12k/hif.h
++++ b/drivers/net/wireless/ath/ath12k/hif.h
+@@ -30,6 +30,7 @@
+ 	void (*ce_irq_enable)(struct ath12k_base *ab);
+ 	void (*ce_irq_disable)(struct ath12k_base *ab);
+ 	void (*get_ce_msi_idx)(struct ath12k_base *ab, u32 ce_id, u32 *msi_idx);
++	void (*config_static_window)(struct ath12k_base *ab);
+ 	int (*panic_handler)(struct ath12k_base *ab);
+ 	void (*coredump_download)(struct ath12k_base *ab);
+ };
+@@ -162,4 +163,10 @@
+ 	if (ab->hif.ops->coredump_download)
+ 		ab->hif.ops->coredump_download(ab);
+ }
++static inline void ath12k_hif_config_static_window(struct ath12k_base *ab)
++{
++	if (ab->hif.ops->config_static_window)
++		ab->hif.ops->config_static_window(ab);
++}
++
+ #endif /* ATH12K_HIF_H */
+diff -ruN a/drivers/net/wireless/ath/ath12k/hw.h b/drivers/net/wireless/ath/ath12k/hw.h
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -97,6 +97,7 @@
+ 
+ #define ATH12K_PCIE_MAX_PAYLOAD_SIZE	128
+ #define ATH12K_IPQ5332_USERPD_ID	1
++#define ATH12K_QCN6432_USERPD_ID	2
+ 
+ enum ath12k_hw_rate_cck {
+ 	ATH12K_HW_RATE_CCK_LP_11M = 0,
+diff -ruN a/drivers/net/wireless/ath/ath12k/qmi.c b/drivers/net/wireless/ath/ath12k/qmi.c
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -9,6 +9,7 @@
+ #include "qmi.h"
+ #include "core.h"
+ #include "debug.h"
++#include "hif.h"
+ #include <linux/of.h>
+ #include <linux/firmware.h>
+ #include <linux/of_address.h>
+@@ -2572,6 +2573,14 @@
+ 							      &ab->qmi.target_mem[i],
+ 							      mlo_idx);
+ 			mlo_idx++;
++		} else if (ab->qmi.target_mem[i].type == AFC_MEM_REGION_TYPE) {
++			if (ab->qmi.target_mem[i].v.addr) {
++				dma_free_coherent(ab->dev,
++						  ab->qmi.target_mem[i].prev_size,
++						  ab->qmi.target_mem[i].v.addr,
++						  ab->qmi.target_mem[i].paddr);
++				ab->qmi.target_mem[i].v.addr = NULL;
++			}
+ 		} else {
+ 			if (test_bit(ATH12K_FLAG_FIXED_MEM_REGION, &ab->dev_flags) &&
+ 			    ab->qmi.target_mem[i].v.ioaddr) {
+@@ -3133,6 +3152,24 @@
+ 			ab->qmi.target_mem[idx].type = ab->qmi.target_mem[i].type;
+ 			idx++;
+ 			break;
++		case AFC_MEM_REGION_TYPE:
++			ab->qmi.target_mem[idx].size = ab->qmi.target_mem[i].size;
++			ab->qmi.target_mem[idx].type = ab->qmi.target_mem[i].type;
++			ab->qmi.target_mem[idx].v.addr =
++				dma_alloc_coherent(ab->dev, ab->qmi.target_mem[idx].size,
++						   &ab->qmi.target_mem[idx].paddr,
++						   GFP_KERNEL);
++			if (!ab->qmi.target_mem[idx].v.addr) {
++				ret = -ENOMEM;
++				goto out;
++			}
++			ab->qmi.target_mem[idx].prev_size = ab->qmi.target_mem[idx].size;
++			ab->qmi.target_mem[idx].prev_type = ab->qmi.target_mem[idx].type;
++			ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi afc mem %u bytes at %pad\n",
++				   ab->qmi.target_mem[idx].size,
++				   &ab->qmi.target_mem[idx].paddr);
++			idx++;
++			break;
+ 		default:
+ 			ath12k_warn(ab, "qmi ignore invalid mem req type %u\n",
+ 				    ab->qmi.target_mem[i].type);
+@@ -4080,6 +4117,140 @@
+ 	return ret;
+ }
+ 
++static const struct qmi_elem_info qmi_wlanfw_device_info_req_msg_v01_ei[] = {
++	{
++		.data_type	= QMI_EOTI,
++		.array_type	= NO_ARRAY,
++		.tlv_type	= QMI_COMMON_TLV_TYPE,
++	},
++};
++
++static const struct qmi_elem_info qmi_wlanfw_device_info_resp_msg_v01_ei[] = {
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= 1,
++		.elem_size	= sizeof(struct qmi_response_type_v01),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x02,
++		.offset		= offsetof(struct qmi_wlanfw_device_info_resp_msg_v01,
++					   resp),
++		.ei_array	= qmi_response_type_v01_ei,
++	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct qmi_wlanfw_device_info_resp_msg_v01,
++					   bar_addr_valid),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u64),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct qmi_wlanfw_device_info_resp_msg_v01,
++					   bar_addr),
++	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x11,
++		.offset		= offsetof(struct qmi_wlanfw_device_info_resp_msg_v01,
++					   bar_size_valid),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u32),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x11,
++		.offset		= offsetof(struct qmi_wlanfw_device_info_resp_msg_v01,
++					   bar_size),
++	},
++	{
++		.data_type	= QMI_EOTI,
++		.array_type	= NO_ARRAY,
++		.tlv_type	= QMI_COMMON_TLV_TYPE,
++	},
++};
++
++/* Hybrid devices: ask the firmware where the device registers live and
++ * map them; the static register windows are then configured.
++ */
++int ath12k_qmi_request_device_info(struct ath12k_base *ab)
++{
++	struct qmi_wlanfw_device_info_req_msg_v01 req = {};
++	struct qmi_wlanfw_device_info_resp_msg_v01 resp = {};
++	struct qmi_txn txn;
++	int ret;
++
++	if (ab->hw_rev != ATH12K_HW_QCN6432_HW10)
++		return 0;
++
++	/* The BAR mapping outlives a firmware restart, the target's window
++	 * register does not: without re-programming it, the first CE access
++	 * after recovery lands outside the static windows and the target
++	 * faults (NOC error).
++	 */
++	if (ab->mem) {
++		ath12k_hif_config_static_window(ab);
++		return 0;
++	}
++
++	ret = qmi_txn_init(&ab->qmi.handle, &txn,
++			   qmi_wlanfw_device_info_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		return ret;
++
++	ret = qmi_send_request(&ab->qmi.handle, NULL, &txn,
++			       QMI_WLANFW_DEVICE_INFO_REQ_V01,
++			       QMI_WLANFW_DEVICE_INFO_REQ_MSG_V01_MAX_LEN,
++			       qmi_wlanfw_device_info_req_msg_v01_ei, &req);
++	if (ret < 0) {
++		qmi_txn_cancel(&txn);
++		ath12k_warn(ab, "failed to send device info request: %d\n", ret);
++		return ret;
++	}
++
++	ret = qmi_txn_wait(&txn, msecs_to_jiffies(ATH12K_QMI_WLANFW_TIMEOUT_MS));
++	if (ret < 0) {
++		ath12k_warn(ab, "device info request timed out: %d\n", ret);
++		return ret;
++	}
++
++	if (resp.resp.result != QMI_RESULT_SUCCESS_V01) {
++		ath12k_warn(ab, "device info request failed: %d %d\n",
++			    resp.resp.result, resp.resp.error);
++		return -EINVAL;
++	}
++
++	if (!resp.bar_addr_valid || !resp.bar_size_valid || !resp.bar_addr ||
++	    resp.bar_size != ATH12K_QCN6432_DEVICE_BAR_SIZE) {
++		ath12k_warn(ab, "invalid device info: addr 0x%llx size 0x%x\n",
++			    resp.bar_addr, resp.bar_size);
++		return -EINVAL;
++	}
++
++	ab->mem = ioremap(resp.bar_addr, resp.bar_size);
++	if (!ab->mem) {
++		ath12k_warn(ab, "failed to map device BAR 0x%llx\n", resp.bar_addr);
++		return -EIO;
++	}
++	ab->mem_len = resp.bar_size;
++
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "device BAR pa 0x%llx size 0x%x mapped\n",
++		   resp.bar_addr, resp.bar_size);
++
++	ath12k_hif_config_static_window(ab);
++
++	return 0;
++}
++
+ /* clang stack usage explodes if this is inlined */
+ static noinline_for_stack
+ int ath12k_qmi_event_load_bdf(struct ath12k_qmi *qmi)
+@@ -4094,6 +4265,12 @@
+ 		return ret;
+ 	}
+ 
++	ret = ath12k_qmi_request_device_info(ab);
++	if (ret < 0) {
++		ath12k_warn(ab, "qmi failed to get device info: %d\n", ret);
++		return ret;
++	}
++
+ 	ret = ath12k_qmi_load_bdf_qmi(ab, ATH12K_QMI_BDF_TYPE_REGDB);
+ 	if (ret < 0) {
+ 		ath12k_warn(ab, "qmi failed to load regdb file:%d\n", ret);
+diff -ruN a/drivers/net/wireless/ath/ath12k/qmi.h b/drivers/net/wireless/ath/ath12k/qmi.h
+--- a/drivers/net/wireless/ath/ath12k/qmi.h
++++ b/drivers/net/wireless/ath/ath12k/qmi.h
+@@ -21,6 +21,7 @@
+ 
+ #define ATH12K_QMI_WLFW_SERVICE_INS_ID_V01_QCN9274	0x07
+ #define ATH12K_QMI_WLFW_SERVICE_INS_ID_V01_IPQ5332	0x2
++#define ATH12K_QMI_WLFW_SERVICE_INS_ID_V01_QCN6432	0x60
+ #define ATH12K_QMI_WLANFW_MAX_TIMESTAMP_LEN_V01	32
+ #define ATH12K_QMI_RESP_LEN_MAX			8192
+ #define ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01	52
+@@ -647,4 +649,26 @@
+ void ath12k_qmi_trigger_host_cap(struct ath12k_base *ab);
+ void ath12k_qmi_reset_mlo_mem(struct ath12k_hw_group *ag);
+ 
++/* Hybrid (Q6-enumerated) devices such as QCN6432 report their register
++ * window (BAR) over QMI instead of having an MMIO resource.
++ */
++#define QMI_WLANFW_DEVICE_INFO_REQ_V01			0x004C
++#define QMI_WLANFW_DEVICE_INFO_REQ_MSG_V01_MAX_LEN	0
++#define QMI_WLANFW_DEVICE_INFO_RESP_MSG_V01_MAX_LEN	32
++#define ATH12K_QCN6432_DEVICE_BAR_SIZE			0x200000
++
++struct qmi_wlanfw_device_info_req_msg_v01 {
++	char placeholder;
++};
++
++struct qmi_wlanfw_device_info_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++	u64 bar_addr;
++	u32 bar_size;
++	u8 bar_addr_valid;
++	u8 bar_size_valid;
++};
++
++int ath12k_qmi_request_device_info(struct ath12k_base *ab);
++
+ #endif
+diff -ruN a/drivers/net/wireless/ath/ath12k/wifi7/ahb.c b/drivers/net/wireless/ath/ath12k/wifi7/ahb.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/ahb.c
+@@ -19,6 +19,9 @@
+ 	{ .compatible = "qcom,ipq5332-wifi",
+ 	  .data = (void *)ATH12K_HW_IPQ5332_HW10,
+ 	},
++	{ .compatible = "qcom,qcn6432-wifi",
++	  .data = (void *)ATH12K_HW_QCN6432_HW10,
++	},
+ 	{ .compatible = "qcom,ipq5424-wifi",
+ 	  .data = (void *)ATH12K_HW_IPQ5424_HW10,
+ 	},
+@@ -43,6 +46,15 @@
+ 		ab_ahb->userpd_id = ATH12K_IPQ5332_USERPD_ID;
+ 		ab_ahb->scm_auth_enabled = true;
+ 		break;
++	case ATH12K_HW_QCN6432_HW10:
++		/* Q6-enumerated companion radio: user PD 2, registers via a
++		 * QMI-provided window, GIC MSIs.
++		 */
++		ab_ahb->userpd_id = ATH12K_QCN6432_USERPD_ID;
++		ab_ahb->scm_auth_enabled = true;
++		ab_ahb->hybrid = true;
++		ab->static_window_map = true;
++		break;
+ 	case ATH12K_HW_IPQ5424_HW10:
+ 		ab_ahb->userpd_id = ATH12K_IPQ5332_USERPD_ID;
+ 		ab_ahb->scm_auth_enabled = false;
+diff -ruN a/drivers/net/wireless/ath/ath12k/wifi7/hal.c b/drivers/net/wireless/ath/ath12k/wifi7/hal.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal.c
+@@ -50,6 +50,13 @@
+ 		.hal_params = &ath12k_hw_hal_params_wcn7850,
+ 		.hw_regs = &qcc2072_regs,
+ 	},
++	[ATH12K_HW_QCN6432_HW10] = {
++		.hal_ops = &hal_qcn9274_ops,
++		.hal_desc_sz = sizeof(struct hal_rx_desc_qcn9274_compact),
++		.tcl_to_wbm_rbm_map = ath12k_hal_tcl_to_wbm_rbm_map_qcn9274,
++		.hal_params = &ath12k_hw_hal_params_ipq5332,
++		.hw_regs = &qcn6432_regs,
++	},
+ 	[ATH12K_HW_IPQ5424_HW10] = {
+ 		.hal_ops = &hal_qcn9274_ops,
+ 		.hal_desc_sz = sizeof(struct hal_rx_desc_qcn9274_compact),
+diff -ruN a/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c b/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c
+@@ -484,6 +484,95 @@
+ 		HAL_IPQ5332_CE_WFSS_REG_BASE,
+ };
+ 
++/* QCN6432 (5 GHz companion of IPQ5332, user PD 2): same HAL register
++ * layout as the IPQ5332 radio.
++ */
++const struct ath12k_hw_regs qcn6432_regs = {
++	/* SW2TCL(x) R0 ring configuration address */
++	.tcl1_ring_id = 0x00000918,
++	.tcl1_ring_misc = 0x00000920,
++	.tcl1_ring_tp_addr_lsb = 0x0000092c,
++	.tcl1_ring_tp_addr_msb = 0x00000930,
++	.tcl1_ring_consumer_int_setup_ix0 = 0x00000940,
++	.tcl1_ring_consumer_int_setup_ix1 = 0x00000944,
++	.tcl1_ring_msi1_base_lsb = 0x00000958,
++	.tcl1_ring_msi1_base_msb = 0x0000095c,
++	.tcl1_ring_base_lsb = 0x00000910,
++	.tcl1_ring_base_msb = 0x00000914,
++	.tcl1_ring_msi1_data = 0x00000960,
++	.tcl2_ring_base_lsb = 0x00000988,
++	.tcl_ring_base_lsb = 0x00000b68,
++
++	/* TCL STATUS ring address */
++	.tcl_status_ring_base_lsb = 0x00000d48,
++
++	/* REO DEST ring address */
++	.reo2_ring_base = 0x00000578,
++	.reo1_misc_ctrl_addr = 0x00000b9c,
++	.reo1_sw_cookie_cfg0 = 0x0000006c,
++	.reo1_sw_cookie_cfg1 = 0x00000070,
++	.reo1_qdesc_lut_base0 = 0x00000074,
++	.reo1_qdesc_lut_base1 = 0x00000078,
++	.reo1_ring_base_lsb = 0x00000500,
++	.reo1_ring_base_msb = 0x00000504,
++	.reo1_ring_id = 0x00000508,
++	.reo1_ring_misc = 0x00000510,
++	.reo1_ring_hp_addr_lsb = 0x00000514,
++	.reo1_ring_hp_addr_msb = 0x00000518,
++	.reo1_ring_producer_int_setup = 0x00000524,
++	.reo1_ring_msi1_base_lsb = 0x00000548,
++	.reo1_ring_msi1_base_msb = 0x0000054C,
++	.reo1_ring_msi1_data = 0x00000550,
++	.reo1_aging_thres_ix0 = 0x00000B28,
++	.reo1_aging_thres_ix1 = 0x00000B2C,
++	.reo1_aging_thres_ix2 = 0x00000B30,
++	.reo1_aging_thres_ix3 = 0x00000B34,
++
++	/* REO Exception ring address */
++	.reo2_sw0_ring_base = 0x000008c0,
++
++	/* REO Reinject ring address */
++	.sw2reo_ring_base = 0x00000320,
++	.sw2reo1_ring_base = 0x00000398,
++
++	/* REO cmd ring address */
++	.reo_cmd_ring_base = 0x000002A8,
++
++	/* REO status ring address */
++	.reo_status_ring_base = 0x00000aa0,
++
++	/* WBM idle link ring address */
++	.wbm_idle_ring_base_lsb = 0x00000d3c,
++	.wbm_idle_ring_misc_addr = 0x00000d4c,
++	.wbm_r0_idle_list_cntl_addr = 0x00000240,
++	.wbm_r0_idle_list_size_addr = 0x00000244,
++	.wbm_scattered_ring_base_lsb = 0x00000250,
++	.wbm_scattered_ring_base_msb = 0x00000254,
++	.wbm_scattered_desc_head_info_ix0 = 0x00000260,
++	.wbm_scattered_desc_head_info_ix1   = 0x00000264,
++	.wbm_scattered_desc_tail_info_ix0 = 0x00000270,
++	.wbm_scattered_desc_tail_info_ix1 = 0x00000274,
++	.wbm_scattered_desc_ptr_hp_addr = 0x0000027c,
++
++	/* SW2WBM release ring address */
++	.wbm_sw_release_ring_base_lsb = 0x0000037c,
++
++	/* WBM2SW release ring address */
++	.wbm0_release_ring_base_lsb = 0x00000e08,
++	.wbm1_release_ring_base_lsb = 0x00000e80,
++
++	/* PPE release ring address */
++	.ppe_rel_ring_base = 0x0000046c,
++
++	/* CE address: reached through the static register window of the
++	 * QMI-provided BAR, so absolute WCSS offsets like QCN9274.
++	 */
++	.umac_ce0_src_reg_base = 0x01b80000,
++	.umac_ce0_dest_reg_base = 0x01b81000,
++	.umac_ce1_src_reg_base = 0x01b82000,
++	.umac_ce1_dest_reg_base = 0x01b83000,
++};
++
+ const struct ath12k_hw_regs ipq5424_regs = {
+ 	/* SW2TCL(x) R0 ring configuration address */
+ 	.tcl1_ring_id = 0x00000918,
+diff -ruN a/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.h b/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.h
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.h
+@@ -17,6 +17,7 @@
+ extern const struct ath12k_hw_regs qcn9274_v1_regs;
+ extern const struct ath12k_hw_regs qcn9274_v2_regs;
+ extern const struct ath12k_hw_regs ipq5332_regs;
++extern const struct ath12k_hw_regs qcn6432_regs;
+ extern const struct ath12k_hw_regs ipq5424_regs;
+ extern const struct ath12k_hal_tcl_to_wbm_rbm_map
+ ath12k_hal_tcl_to_wbm_rbm_map_qcn9274[DP_TCL_NUM_RING_MAX];
+diff -ruN a/drivers/net/wireless/ath/ath12k/wifi7/hw.c b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -252,6 +252,54 @@
+ 	},
+ };
+ 
++/* QCN6432: eight DP MSI vectors, one per group. Every tx and rx ring gets a
++ * group of its own: ath12k_wifi7_dp_service_srng() services only the highest
++ * set bit of a group's tx/rx mask (fls()), so the "TX_RING_MASK_2 | _3" and
++ * "RX_RING_MASK_2 | _3" groups of QSDK's first bring-up left tx completion
++ * ring 2 and REO destination ring 2 unserviced (QSDK split them later, in
++ * 957-wifi-ath12k-DP-MSI-changes-for-QCN6432). Rings of the single pdev only,
++ * so one rxdma / mon-dest slot.
++ */
++static const struct ath12k_hw_ring_mask ath12k_wifi7_hw_ring_mask_qcn6432 = {
++	.tx  = {
++		ATH12K_TX_RING_MASK_0,
++		ATH12K_TX_RING_MASK_1,
++		ATH12K_TX_RING_MASK_2,
++		ATH12K_TX_RING_MASK_3,
++	},
++	.rx_mon_dest = {
++		0, 0,
++		ATH12K_RX_MON_RING_MASK_0,
++	},
++	.rx = {
++		0, 0, 0, 0,
++		ATH12K_RX_RING_MASK_0,
++		ATH12K_RX_RING_MASK_1,
++		ATH12K_RX_RING_MASK_2,
++		ATH12K_RX_RING_MASK_3,
++	},
++	.rx_err = {
++		0, 0,
++		ATH12K_RX_ERR_RING_MASK_0,
++	},
++	.rx_wbm_rel = {
++		0, 0,
++		ATH12K_RX_WBM_REL_RING_MASK_0,
++	},
++	.reo_status = {
++		0, 0,
++		ATH12K_REO_STATUS_RING_MASK_0,
++	},
++	.host2rxdma = {
++		0, 0,
++		ATH12K_HOST2RXDMA_RING_MASK_0,
++	},
++	.tx_mon_dest = {
++		ATH12K_TX_MON_RING_MASK_0,
++		ATH12K_TX_MON_RING_MASK_1,
++	},
++};
++
+ static const struct ath12k_hw_ring_mask ath12k_wifi7_hw_ring_mask_ipq5332 = {
+ 	.tx  = {
+ 		ATH12K_TX_RING_MASK_0,
+@@ -694,6 +742,87 @@
+ 
+ 		.dp_primary_link_only = true,
+ 		.client = {
++			.max_client_single = 256,
++			.max_client_dbs = 128,
++			.max_client_dbs_sbs = 128,
++		},
++	},
++	{
++		.name = "qcn6432 hw1.0",
++		.hw_rev = ATH12K_HW_QCN6432_HW10,
++		.fw = {
++			.dir = "QCN6432/hw1.0",
++			.board_size = 256 * 1024,
++			.cal_offset = 128 * 1024,
++			.m3_loader = ath12k_m3_fw_loader_remoteproc,
++			.download_aux_ucode = false,
++		},
++		.max_radios = 1,
++		.single_pdev_only = false,
++		.qmi_service_ins_id = ATH12K_QMI_WLFW_SERVICE_INS_ID_V01_QCN6432,
++		.internal_sleep_clock = false,
++
++		.hw_ops = &qcn9274_ops,
++		.ring_mask = &ath12k_wifi7_hw_ring_mask_qcn6432,
++
++		.host_ce_config = ath12k_wifi7_host_ce_config_ipq5332,
++		.ce_count = 12,
++		.target_ce_config = ath12k_wifi7_target_ce_config_wlan_ipq5332,
++		.target_ce_count = 12,
++		.svc_to_ce_map =
++			ath12k_wifi7_target_service_to_ce_map_wlan_ipq5332,
++		.svc_to_ce_map_len = 18,
++
++		.rxdma1_enable = true,
++		.num_rxdma_per_pdev = 1,
++		.num_rxdma_dst_ring = 0,
++		.rx_mac_buf_ring = false,
++		.vdev_start_delay = false,
++
++		.interface_modes = BIT(NL80211_IFTYPE_STATION) |
++				   BIT(NL80211_IFTYPE_AP) |
++				   BIT(NL80211_IFTYPE_MESH_POINT) |
++				   BIT(NL80211_IFTYPE_AP_VLAN),
++		.supports_monitor = true,
++
++		.idle_ps = false,
++		.download_calib = true,
++		.supports_suspend = false,
++		.tcl_ring_retry = true,
++		.reoq_lut_support = false,
++		.supports_shadow_regs = false,
++
++		.num_tcl_banks = 48,
++		.max_tx_ring = 4,
++
++		.wmi_init = &ath12k_wifi7_wmi_init_qcn9274,
++
++		.qmi_cnss_feature_bitmap = BIT(CNSS_QDSS_CFG_MISS_V01),
++
++		.rfkill_pin = 0,
++		.rfkill_cfg = 0,
++		.rfkill_on_level = 0,
++
++		.rddm_size = 0,
++
++		.def_num_link = 0,
++		.max_mlo_peer = 256,
++
++		.otp_board_id_register = 0,
++
++		.supports_sta_ps = false,
++
++		.acpi_guid = NULL,
++		.supports_dynamic_smps_6ghz = false,
++		.iova_mask = 0,
++		.supports_aspm = false,
++
++		.ce_ie_addr = NULL,
++		.ce_remap = NULL,
++		.bdf_addr_offset = 0,
++
++		.dp_primary_link_only = true,
++		.client = {
+ 			.max_client_single = 256,
+ 			.max_client_dbs = 128,
+ 			.max_client_dbs_sbs = 128,

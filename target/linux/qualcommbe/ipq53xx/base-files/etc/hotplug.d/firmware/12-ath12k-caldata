@@ -7,8 +7,23 @@ board=$(board_name)
 case "$FIRMWARE" in
 "ath12k/IPQ5332/hw1.0/cal-ahb-c000000.wifi.bin")
 	case "$board" in
+	gl.inet,gl-be3600)
+		# DIAG v8: full 128KiB ART region like be6500 - the truncated
+		# 0x11800 extraction is the prime platform_regulatory_auth suspect.
+		caldata_extract "0:art" 0x1000 0x20000
+		;;
 	gl.inet,gl-be6500)
 		caldata_extract "0:art" 0x1000 0x20000
+		;;
+	esac
+	;;
+"ath12k/QCN6432/hw1.0/cal-ahb-soc@0:wifi-qcn6432.bin")
+	case "$board" in
+	gl.inet,gl-be3600)
+		# QCN6432 (5 GHz) block: offset 0x12800 and region 0x1b800 straight from
+		# ftm.conf ("ap-mi04.1-c2,0053,1,75776,112640,0"). Region-sized for the
+		# same reason as above (the tested unit"s block is 0x18800).
+		caldata_extract "0:art" 0x12800 0x1b800
 		;;
 	esac
 	;;

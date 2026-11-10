@@ -1,0 +1,25 @@
+#!/bin/sh
+# Do not let a Wi-Fi firmware crash wait five minutes for a coredump reader.
+#
+# The secure-PIL remoteproc driver sets RPROC_COREDUMP_INLINE, which blocks
+# recovery of the Q6 (both radios: the QCN6432 runs as a user PD on it) until
+# userspace reads /sys/class/devcoredump/devcdN or devcoredump's 5-minute
+# timeout expires. Nothing on OpenWrt reads it, so every firmware crash meant
+# five minutes without Wi-Fi on either band. "enabled" still captures the
+# dump (readable for 5 minutes) but recovers at once.
+#
+
+[ "$ACTION" = "add" ] || exit 0
+
+. /lib/functions.sh
+case "$(board_name)" in
+gl.inet,gl-be3600) ;;
+*) exit 0 ;;
+esac
+
+for rproc in /sys/class/remoteproc/remoteproc*; do
+	[ "$(cat "$rproc/name" 2>/dev/null)" = "q6wcss" ] || continue
+	[ "$(cat "$rproc/coredump")" = "inline" ] && echo enabled > "$rproc/coredump"
+done
+
+exit 0

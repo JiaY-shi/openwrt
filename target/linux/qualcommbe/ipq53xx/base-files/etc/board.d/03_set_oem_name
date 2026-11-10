@@ -7,6 +7,10 @@ ipq53xx_set_oem_name()
 {
 	local board="$1"
 	case $board in
+	gl.inet,gl-be3600)
+		oem_name="gl-be3600"
+		echo "$oem_name" > "$oem_file"
+		;;
 	gl.inet,gl-be6500)
 		oem_name="gl-be6500"
 		echo "$oem_name" > "$oem_file"

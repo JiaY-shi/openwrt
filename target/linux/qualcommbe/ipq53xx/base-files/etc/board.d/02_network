@@ -8,11 +8,32 @@
 
 ipq53xx_setup_interfaces()
 {
-	local board="$1"
+	local board="$1" lan_mac wan_mac art country
 
 	case "$board" in
 	ubnt,u7-pro-xgs)
 		ucidef_set_interface_lan "lan"
+		;;
+	gl.inet,gl-be3600)
+		ucidef_set_interfaces_lan_wan "lan" "wan"
+		# The ports take their addresses from the ART nvmem cell in the
+		# DTS (base +0 wan, +1 lan), like the radios do; only the label
+		# address is recorded here.
+		wan_mac=$(mtd_get_mac_binary "0:art" 0x6)
+		[ -n "$wan_mac" ] && ucidef_set_label_macaddr "$wan_mac"
+
+		# Factory regulatory country: 2 ASCII bytes at ART 0x88 (ISO 3166, upper case).
+		# Set through board.json rather than a uci-default, because
+		# mac80211.uc reads board.wlan.defaults.country when it creates EACH
+		# wifi-device. The QCN6432 phy registers ~30 s after uci-defaults have
+		# run, so the uci-default only ever reached radio0 - measured on a
+		# fresh install: radio0 got the country, radio1 got nothing.
+		art=$(find_mtd_part "0:art")
+		if [ -n "$art" ]; then
+			country=$(dd if="$art" bs=1 skip=136 count=2 2>/dev/null |
+				tr "[:lower:]" "[:upper:]" | tr -dc "A-Z")
+			[ "${#country}" = 2 ] && ucidef_set_country "$country"
+		fi
 		;;
 	gl.inet,gl-be6500)
 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"

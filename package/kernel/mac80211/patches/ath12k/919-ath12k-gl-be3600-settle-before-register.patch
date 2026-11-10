@@ -1,0 +1,41 @@
+From: Beaverfffan <Beaverfffan@users.noreply.github.com>
+Subject: ath12k: give the GL-BE3600 a settle window before the first START_AP
+
+netifd and hostapd are already waiting when the phy appears on this board,
+so START_AP can land ~300 ms after the firmware reports ready.  The
+firmware accepts the vdev but never puts a beacon on the air, while
+hostapd still logs AP-ENABLED and the interface stays bridged, which looks
+exactly like a missing signal.  Leaving a few seconds between the phy
+appearing and the first START_AP avoids it (measured: 0.3 s silent,
+5.3 s beacons), so delay the registration on this machine only.
+
+Signed-off-by: Beaverfffan <Beaverfffan@users.noreply.github.com>
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/export.h>
++#include <linux/delay.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/remoteproc.h>
+@@ -1252,6 +1253,17 @@
+ 	if (WARN_ON(ret))
+ 		goto err_mac_destroy;
+ 
++	/* The GL-BE3600 comes up with netifd and hostapd already waiting for
++	 * the phy, so START_AP can land ~300 ms after the firmware reports
++	 * ready.  On this board the firmware then accepts the vdev but never
++	 * puts a beacon on the air, while hostapd still logs AP-ENABLED and
++	 * the interface stays bridged - it looks exactly like a missing
++	 * signal.  Leaving a gap between the phy appearing and the first
++	 * START_AP avoids it (measured: 0.3 s silent, 5.3 s beacons).
++	 */
++	if (of_machine_is_compatible("gl.inet,gl-be3600"))
++		msleep(6000);
++
+ 	ret = ath12k_mac_register(ag);
+ 	if (WARN_ON(ret))
+ 		goto err_mlo_teardown;
