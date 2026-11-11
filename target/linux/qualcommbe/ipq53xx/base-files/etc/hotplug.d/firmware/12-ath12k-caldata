@@ -10,12 +10,19 @@ case "$FIRMWARE" in
 	gl.inet,gl-be6500)
 		caldata_extract "0:art" 0x1000 0x20000
 		;;
+	gl.inet,gl-be9300)
+		caldata_extract_mmc "0:ART" 0x1000 0x20000
+		;;
 	esac
 	;;
 "ath12k/QCN9274/hw2.0/cal-pci-0001:01:00.0.bin")
 	case "$board" in
 	gl.inet,gl-be6500)
 		caldata_extract "0:art" 0x58800 0x18800
+		;;
+	gl.inet,gl-be9300)
+		# The dual-MAC QCN9274 calibration block covers both 5 and 6 GHz.
+		caldata_extract_mmc "0:ART" 0x58800 0x27800
 		;;
 	esac
 	;;

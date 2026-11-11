@@ -12,6 +12,14 @@ define Build/gl-ipq-factory-nand
 	$(RM) $@.its $(KDIR_TMP)/$(notdir $(BOOT_SCRIPT))
 endef
 
+define Build/gl-ipq-factory-emmc
+	$(TOPDIR)/scripts/mkits-qsdk-ipq-image.sh \
+		$@.its $(CURDIR)/$(BOOT_SCRIPT) hlos $(IMAGE_KERNEL) rootfs $@
+	PATH=$(LINUX_DIR)/scripts/dtc:$(PATH) mkimage -f $@.its $@.new
+	@mv $@.new $@
+	$(RM) $@.its
+endef
+
 define Build/fit-inline-rootfs
 	rm -f $@.dtb $@.kernel
 	cp $@ $@.kernel
@@ -81,3 +89,28 @@ define Device/glinet_gl-be6500
 		kmod-usb-storage kmod-usb-storage-uas blockd usbutils dumpimage
 endef
 TARGET_DEVICES += glinet_gl-be6500
+
+define Device/glinet_gl-be9300
+	$(call Device/FitImage)
+	$(call Device/EmmcImage)
+	DEVICE_VENDOR := GL.iNet
+	DEVICE_MODEL := GL-BE9300
+	DEVICE_ALT0_VENDOR := GL.iNet
+	DEVICE_ALT0_MODEL := Flint 3
+	# Stock bootipq falls back to config-1 for AP-MI01.6.
+	DEVICE_DTS_CONFIG := config-1
+	SOC := ipq5332
+	SUPPORTED_DEVICES += gl.inet,gl-be9300 gl-be9300
+	# The factory 0:HLOS eMMC partition is 7 MiB.
+	KERNEL_SIZE := 7168k
+	KERNEL_INSTALL := 1
+	BOOT_SCRIPT := glinet_gl-be9300.bootscript
+	IMAGE/factory.bin := append-rootfs | pad-rootfs | pad-to 64k | \
+		gl-ipq-factory-emmc | append-gl-metadata
+	DEVICE_PACKAGES := kmod-ath12k ath12k-firmware-ipq5332 \
+		ath12k-firmware-qcn9274 ipq-wifi-glinet_gl-be9300 \
+		kmod-hwmon-pwmfan kmod-qrtr-smd kmod-rtl837x-dsa \
+		kmod-phy-realtek f2fsck mkf2fs dumpimage \
+		kmod-usb-storage kmod-usb-storage-uas blockd usbutils
+endef
+TARGET_DEVICES += glinet_gl-be9300

@@ -48,6 +48,7 @@ ALLWIFIBOARDS:= \
 	glinet_gl-axt1800 \
 	glinet_gl-b3000 \
 	glinet_gl-be6500 \
+	glinet_gl-be9300 \
 	glinet_gl-x2000 \
 	huawei_ap4050dn \
 	ignitenet_ss-w2-ac2600 \
@@ -267,6 +268,7 @@ $(eval $(call generate-ipq-wifi-package,glinet_gl-ax1800,GL.iNet GL-AX1800))
 $(eval $(call generate-ipq-wifi-package,glinet_gl-axt1800,GL.iNet GL-AXT1800))
 $(eval $(call generate-ipq-wifi-package,glinet_gl-b3000,GL.iNet GL-B3000))
 $(eval $(call generate-ipq-wifi-package,glinet_gl-be6500,GL.iNet GL-BE6500))
+$(eval $(call generate-ipq-wifi-package,glinet_gl-be9300,GL.iNet GL-BE9300))
 $(eval $(call generate-ipq-wifi-package,glinet_gl-x2000,GL.iNet GL-X2000))
 $(eval $(call generate-ipq-wifi-package,huawei_ap4050dn,Huawei AP4050DN))
 $(eval $(call generate-ipq-wifi-package,ignitenet_ss-w2-ac2600,Ignitenet SS-W2-AC2600))

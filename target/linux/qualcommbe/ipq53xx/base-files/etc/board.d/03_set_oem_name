@@ -11,6 +11,10 @@ ipq53xx_set_oem_name()
 		oem_name="gl-be6500"
 		echo "$oem_name" > "$oem_file"
 		;;
+	gl.inet,gl-be9300)
+		oem_name="gl-be9300"
+		echo "$oem_name" > "$oem_file"
+		;;
 	esac
 }
 

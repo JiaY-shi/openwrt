@@ -53,6 +53,16 @@ platform_do_upgrade() {
 			nand_do_upgrade "$1"
 		fi
 		;;
+	gl.inet,gl-be9300)
+		CI_KERNPART="0:HLOS"
+		CI_ROOTPART="rootfs"
+		CI_ROOTDEV="mmcblk0"
+		EMMC_KERN_DEV=$(find_mmc_part "$CI_KERNPART" "$CI_ROOTDEV")
+		EMMC_ROOT_DEV=$(find_mmc_part "$CI_ROOTPART" "$CI_ROOTDEV")
+		[ -b "$EMMC_KERN_DEV" ] && [ -b "$EMMC_ROOT_DEV" ] || exit 1
+		platform_check_image "$1" || exit 1
+		emmc_do_upgrade "$1" || exit 1
+		;;
 	ubnt,u7-pro-xgs)
 		CI_KERNPART="kernel0"
 		fit_do_upgrade "$1"
@@ -77,6 +87,14 @@ platform_check_image() {
 		fi
 		return 0
 		;;
+	gl.inet,gl-be9300)
+		local board_dir gz
+
+		[ "$(identify_magic_long "$(get_magic_long "$1" cat)")" = gzip ] && gz=z
+		board_dir=$(tar t${gz}f "$1" 2>/dev/null | grep -m 1 '^sysupgrade-.*/$')
+		[ -n "$board_dir" ] &&
+			tar t${gz}f "$1" "${board_dir}kernel" "${board_dir}root" >/dev/null 2>&1
+		;;
 	ubnt,u7-pro-xgs)
 		fit_check_image "$1"
 		;;
@@ -89,6 +107,7 @@ platform_check_image() {
 
 platform_copy_config() {
 	case "$(board_name)" in
+	gl.inet,gl-be9300|\
 	ubnt,u7-pro-xgs)
 		emmc_copy_config
 		;;
